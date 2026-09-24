@@ -33,8 +33,10 @@ Dispatcher -- Unix RPC --> host Supervisor --> bounded transient Worker
 ```
 
 The application roles have no direct privileges on the private tables. The
-Worker has no database account, credential, or network dependency; it receives
-only a root-created configuration from the Supervisor.
+Worker has no database account, credential, or Compose database-network
+dependency; it receives only a root-created configuration from the Supervisor
+and may connect only to the configured signed endpoint under the host egress
+policy.
 
 ## Verification
 

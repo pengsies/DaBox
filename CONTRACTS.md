@@ -247,10 +247,13 @@ For a browser, the authenticated owner receives this temporary capability URL:
 http://<RelayForge host>:<Worker port>/relay/<48 lowercase hex token>/
 ```
 
-The browser sends HTTP first. The Worker validates and strips the `/relay/`
-token prefix, then forwards the remaining path to its signed private endpoint.
+The browser sends HTTP first. This is deliberately not a general reverse
+proxy: the Worker accepts only `GET` using HTTP/1.0 or HTTP/1.1. It validates
+and strips the `/relay/` token prefix and reconstructs a minimal upstream
+`GET`, `Host`, and `Connection: close` request for the signed private endpoint.
 Missing or incorrect tokens receive an HTTP 403 response. This URL is a
-short-lived bearer credential and expires when the Worker stops.
+short-lived bearer credential and expires when the Worker stops. The separate
+authenticated `CONNECT` path remains a raw bidirectional TCP stream.
 
 In safe mode, `LEAK` and `OVERFLOW` are rejected. In legacy mode, the deliberate
 address leak and bounded callback overwrite are available.
@@ -288,7 +291,8 @@ PLAYER_CIDR     source allowed to reach HTTPS 443 and Workers 25000-25099;
                 defaults to 0.0.0.0/0 for a public CTF
 PUBLIC_IFACE    Ubuntu interface facing those networks
 ENDPOINT_HOST   canonical IPv4 reached by Workers
-ENDPOINT_PORT   endpoint TCP port, normally 80 for the agreed HTTP server
+ENDPOINT_PORT   endpoint TCP port; 19001 for the bundled fixture, otherwise a
+                configured integer from 1 through 65535
 ```
 
 The host firewall must allow UID `relay` to initiate TCP only to the configured

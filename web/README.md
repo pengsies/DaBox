@@ -2,7 +2,8 @@
 
 This service integrates the teammate Flask portal design with the canonical
 RelayForge database API. It runs as UID/GID `65532` under Gunicorn on internal
-port `8080`; nginx is the only Internet-facing service.
+port `8080`; nginx is the only Internet-facing container. Transient host
+Workers separately expose authenticated player ports in `25000-25099`.
 
 Required environment:
 
@@ -29,4 +30,3 @@ Exploit command output is written by the payload to
 `/tmp/relayforge-results/<32-lowercase-hex>.txt`. The authenticated result API
 accepts only same-UID regular files no larger than 64 KiB and removes each file
 after one read. The directory is ephemeral with the container's `/tmp` tmpfs.
-

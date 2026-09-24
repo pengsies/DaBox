@@ -10,6 +10,7 @@ from pathlib import Path
 SHARED = Path(__file__).resolve().parents[1]
 REQUIRED = (
     ".env.example",
+    "ATTACK_REPORT.md",
     "README.md",
     "CONTRACTS.md",
     "DOCKER_COMPONENTS.md",

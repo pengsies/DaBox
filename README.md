@@ -42,6 +42,7 @@ finishes at the Supervisor archive race.
 | `scripts/` | Installer, initialization, reset, firewall, SSH, and verification lifecycle |
 | `tests/` | Source, component, container, endpoint, systemd, and VM acceptance tests |
 | `attacks/` | Flask pickle payload and complete intended-chain verifier |
+| `ATTACK_REPORT.md` | Flask-specific vulnerability chain, privilege boundaries, and current evidence status |
 | `CONTRACTS.md` | Exact DB, signed-job, Unix-RPC, Worker, cancellation, and endpoint contracts |
 | `WEB_REQUIRED.md` | Implemented Flask-specific Web contract |
 | `SETUP.md` | Windows VM creation, Ubuntu Server installer choices, deployment, and acceptance |
