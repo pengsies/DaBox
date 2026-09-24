@@ -240,7 +240,7 @@ current release source rather than a stale extracted directory.
 
 Current source-level and local component evidence includes:
 
-- the 96-file manifest and static intentional-surface audit;
+- the release manifest and static intentional-surface audit;
 - Flask authentication, restricted-pickle, CSRF, and result-path tests;
 - Web database-role and raw-RPC boundary checks;
 - Access first-profile and Worker last-profile behavior;
@@ -269,6 +269,9 @@ chain success.
   persistence but are not substitutes for running the lab on a disposable host.
 - Never deploy this intentionally vulnerable stack alongside real data,
   credentials, or a privileged EC2 instance role.
+
+For a participant-oriented walkthrough, including the exact container-to-host
+trust-boundary transitions, see `PLAYER_ATTACK_GUIDE.md`.
 
 ## Authoritative implementation references
 

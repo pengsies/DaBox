@@ -11,9 +11,11 @@ SHARED = Path(__file__).resolve().parents[1]
 REQUIRED = (
     ".env.example",
     "ATTACK_REPORT.md",
+    "PLAYER_ATTACK_GUIDE.md",
     "README.md",
     "CONTRACTS.md",
     "DOCKER_COMPONENTS.md",
+    "EC2_RECOVERY_AND_UPGRADE.md",
     "SETUP.md",
     "WEB_REQUIRED.md",
     "compose.yaml",

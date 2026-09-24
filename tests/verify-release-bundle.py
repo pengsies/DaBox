@@ -14,9 +14,12 @@ from pathlib import PurePosixPath
 
 REQUIRED = {
     ".env.example",
+    "ATTACK_REPORT.md",
+    "PLAYER_ATTACK_GUIDE.md",
     "README.md",
     "CONTRACTS.md",
     "DOCKER_COMPONENTS.md",
+    "EC2_RECOVERY_AND_UPGRADE.md",
     "SETUP.md",
     "WEB_REQUIRED.md",
     "compose.yaml",
