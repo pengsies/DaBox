@@ -1,0 +1,6 @@
+psycopg==3.3.5
+psycopg-binary==3.3.5
+cryptography==50.0.1
+cffi==2.1.1
+pycparser==3.0
+typing-extensions==4.16.0

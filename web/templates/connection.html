@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Connection{% endblock %}
+{% block content %}
+<section class="dashboard">
+  <div class="dashboard-heading">
+    <div>
+      <p class="eyebrow">CONNECTION STATUS</p>
+      <h1>Private endpoint request</h1>
+    </div>
+    <a class="secondary button-link" href="{{ url_for('dashboard') }}">Back to dashboard</a>
+  </div>
+  <div class="card connection status-card">
+    <span class="badge">{{ status.request_state }}</span>
+    {% if browser_url %}
+      <h2>Your tunnel is ready</h2>
+      <p class="muted">Access approved. Worker port <strong>{{ status.endpoint_port }}</strong> is temporarily forwarding your browser to the private endpoint.</p>
+      <a class="endpoint-link" href="{{ browser_url }}" rel="noreferrer" target="_blank">Open private endpoint <span aria-hidden="true">↗</span></a>
+      <p class="hint">This bearer link expires at {{ status.ends_at }}. Opening it in a new tab uses plain HTTP on the temporary Worker port.</p>
+      <form method="post" action="{{ url_for('cancel_connection') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="id" value="{{ status.request_id }}">
+        <button class="secondary cancel-button" type="submit">Close tunnel</button>
+      </form>
+    {% elif status.request_state == "denied" %}
+      <h2>Access denied</h2>
+      <p class="error">{{ status.request_reason or "This account is not authorized for the selected endpoint." }}</p>
+    {% elif status.job_state in ("failed", "expired", "stopped") %}
+      <h2>Tunnel unavailable</h2>
+      <p class="error">The temporary Worker is {{ status.job_state }}.</p>
+    {% elif refreshing %}
+      <h2>Checking access</h2>
+      <p class="muted">Access and Dispatcher are processing this request. This page refreshes automatically.</p>
+      <p class="hint">Request <code>{{ status.request_id }}</code></p>
+    {% else %}
+      <h2>Request recorded</h2>
+      <p class="muted">Current state: {{ status.request_state }}{% if status.job_state %} / {{ status.job_state }}{% endif %}.</p>
+    {% endif %}
+  </div>
+</section>
+{% endblock %}

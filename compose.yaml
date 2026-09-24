@@ -1,0 +1,219 @@
+name: relayforge
+
+x-common-security: &common-security
+  # relayforge-stack.service owns boot ordering so the host firewall is live
+  # before Docker publishes HTTPS.
+  restart: "no"
+  init: true
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  pids_limit: 128
+  mem_limit: 256m
+  cpus: 1.0
+
+services:
+  edge:
+    <<: *common-security
+    image: nginx:1.30.4-alpine3.24@sha256:862dc06c359bfe5d3211e4106269f040d261e269e58ebf17060d8328c45067c0
+    platform: linux/amd64
+    cap_add:
+      - SETGID
+      - SETUID
+      - NET_BIND_SERVICE
+    ports:
+      - "0.0.0.0:443:443"
+    volumes:
+      - ./config/nginx.conf:/etc/nginx/nginx.conf:ro
+      - /etc/relayforge/secrets/tls:/etc/nginx/tls:ro
+    tmpfs:
+      - /var/cache/nginx/client_temp:uid=101,gid=101,mode=0700,size=4m
+      - /var/cache/nginx/proxy_temp:uid=101,gid=101,mode=0700,size=4m
+      - /var/cache/nginx/fastcgi_temp:uid=101,gid=101,mode=0700,size=1m
+      - /var/cache/nginx/uwsgi_temp:uid=101,gid=101,mode=0700,size=1m
+      - /var/cache/nginx/scgi_temp:uid=101,gid=101,mode=0700,size=1m
+      - /var/run:uid=0,gid=0,mode=0755,size=2m
+      - /tmp:uid=101,gid=101,mode=1770,size=8m
+    networks:
+      - edge_net
+      - frontend_net
+    depends_on:
+      web:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-check-certificate", "-qO-", "https://127.0.0.1/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  web:
+    <<: *common-security
+    build:
+      context: ./web
+    platform: linux/amd64
+    user: "65532:65532"
+    environment:
+      DB_HOST: postgres
+      DB_NAME: relayforge
+      DB_USER: relay_web
+      DB_PASSWORD: ${RELAY_WEB_DB_PASSWORD}
+      FLASK_SECRET_KEY: ${FLASK_SECRET_KEY}
+    tmpfs:
+      - /tmp:uid=65532,gid=65532,mode=0700,size=16m
+    networks:
+      - frontend_net
+      - db_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - import urllib.request; assert urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).read() == b'ok\n'
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+
+  postgres:
+    image: postgres:16.15-alpine3.23@sha256:606bf82e84bdd2d9783702281cf5f2c89a10653612f5827522b2adfae7e3271c
+    platform: linux/amd64
+    restart: "no"
+    init: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 1.5
+    environment:
+      POSTGRES_DB: relayforge
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=trust
+      RELAY_WEB_DB_PASSWORD: ${RELAY_WEB_DB_PASSWORD}
+      RELAY_ACCESS_DB_PASSWORD: ${RELAY_ACCESS_DB_PASSWORD}
+      RELAY_DISPATCH_DB_PASSWORD: ${RELAY_DISPATCH_DB_PASSWORD}
+      RELAY_ENDPOINT_HOST: ${RELAY_ENDPOINT_HOST}
+      RELAY_ENDPOINT_PORT: ${RELAY_ENDPOINT_PORT}
+    command:
+      - postgres
+      - -c
+      - listen_addresses=*
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - max_connections=40
+      - -c
+      - log_connections=on
+      - -c
+      - log_disconnections=on
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    tmpfs:
+      - /run/postgresql:uid=70,gid=70,mode=0750,size=4m
+      - /tmp:uid=70,gid=70,mode=1770,size=16m
+    networks:
+      - db_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d relayforge"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 10s
+
+  access:
+    <<: *common-security
+    build:
+      context: ./control
+    platform: linux/amd64
+    command: ["python3", "/opt/relayforge/access.py"]
+    user: "65532:65532"
+    group_add:
+      - "${RELAY_SIGNING_GID}"
+    environment:
+      DB_HOST: postgres
+      DB_NAME: relayforge
+      DB_USER: relay_access
+      DB_PASSWORD: ${RELAY_ACCESS_DB_PASSWORD}
+      SIGNING_KEY: /run/secrets/job-signing.pem
+      HEARTBEAT_FILE: /run/relayforge/healthy
+    volumes:
+      - /etc/relayforge/secrets/job-signing.pem:/run/secrets/job-signing.pem:ro
+    tmpfs:
+      - /run/relayforge:uid=65532,gid=65532,mode=0700,size=1m
+      - /tmp:uid=65532,gid=65532,mode=0700,size=8m
+    networks:
+      - db_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "/opt/relayforge/healthcheck.py"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+
+  dispatcher:
+    <<: *common-security
+    build:
+      context: ./control
+    platform: linux/amd64
+    command: ["python3", "/opt/relayforge/dispatcher.py"]
+    user: "${DISPATCH_UID}:${RELAY_IPC_GID}"
+    environment:
+      DB_HOST: postgres
+      DB_NAME: relayforge
+      DB_USER: relay_dispatch
+      DB_PASSWORD: ${RELAY_DISPATCH_DB_PASSWORD}
+      SUPERVISOR_SOCKET: /run/relayforge/supervisor.sock
+      HEARTBEAT_FILE: /tmp/relayforge-health
+    volumes:
+      - /run/relayforge:/run/relayforge:ro
+    tmpfs:
+      - /tmp:uid=${DISPATCH_UID},gid=${RELAY_IPC_GID},mode=0700,size=8m
+    networks:
+      - db_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "/opt/relayforge/healthcheck.py"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+
+networks:
+  edge_net:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: rf-edge0
+  frontend_net:
+    driver: bridge
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: rf-front0
+  db_net:
+    driver: bridge
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: rf-db0
+
+volumes:
+  postgres_data: {}

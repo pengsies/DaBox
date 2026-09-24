@@ -1,0 +1,13 @@
+**
+!worker/
+!worker/Makefile
+!worker/relay-worker.c
+!host/
+!host/supervisor.py
+!host/backend.py
+!host/relay-supervisor.service
+!host/relay-backend.service
+!tests/
+!tests/systemd/
+!tests/systemd/sign_job.py
+!tests/systemd/launch_client.py

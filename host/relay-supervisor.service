@@ -1,0 +1,48 @@
+[Unit]
+Description=RelayForge privileged signed-job Supervisor
+After=local-fs.target network.target
+Before=relayforge-stack.service
+ConditionPathIsReadWrite=/var/lib/relayforge/workers
+
+[Service]
+Type=exec
+User=root
+Group=relayforge-ipc
+ExecStart=/usr/bin/python3 /opt/relayforge/runtime/supervisor.py
+Restart=on-failure
+RestartSec=2s
+RuntimeDirectory=relayforge
+RuntimeDirectoryMode=0750
+UMask=0027
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateIPC=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadOnlyPaths=/opt/relayforge /etc/relayforge
+ReadWritePaths=/run/relayforge /var/lib/relayforge/workers
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+AmbientCapabilities=
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ProtectProc=default
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX AF_INET
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+TasksMax=64
+LimitNOFILE=256
+LimitCORE=0
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=multi-user.target

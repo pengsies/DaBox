@@ -1,0 +1,10 @@
+.env
+.env.*
+.git
+.idea
+.pytest_cache
+__pycache__
+*.py[cod]
+*.swp
+tests
+

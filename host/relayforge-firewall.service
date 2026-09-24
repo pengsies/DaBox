@@ -1,0 +1,32 @@
+[Unit]
+Description=RelayForge host and Docker-aware firewall
+Requires=docker.service
+After=docker.service network-online.target
+Before=relayforge-stack.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/relayforge/runtime/firewall.py --config /etc/relayforge/firewall.env
+RemainAfterExit=yes
+User=root
+Group=root
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadOnlyPaths=/opt/relayforge /etc/relayforge
+ReadWritePaths=/run
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_NETLINK AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
