@@ -13,3 +13,6 @@ relay-worker
 build/
 dist/
 secrets/
+compose.override.yaml
+local-tls/
+*.md.local

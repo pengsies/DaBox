@@ -12,6 +12,15 @@
     <a class="brand" href="{{ url_for('index') }}"><span class="mark">R</span> RelayForge</a>
     <span class="header-label">ACCESS PORTAL</span>
   </header>
+  {% if session.username %}
+  <div id="cookie-notice" class="cookie-notice">
+    <p>This site uses cookies to keep you signed in and remember your preferences.</p>
+    <div class="cookie-notice-actions">
+      <a class="cookie-policy-link" href="{{ url_for('cookie_policy') }}">Cookie Policy</a>
+      <a class="cookie-ok" href="#cookie-notice">OK</a>
+    </div>
+  </div>
+  {% endif %}
   <main>{% block content %}{% endblock %}</main>
   <footer>RelayForge · Access Portal</footer>
 </body>

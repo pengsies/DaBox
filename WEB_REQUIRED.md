@@ -45,6 +45,7 @@ Recreating the Web container clears them.
 | `POST /logout` | Destroy the session and redirect to login |
 | `GET /` | Redirect to login or the authenticated dashboard |
 | `GET /dashboard` | Require login, deserialize the `remember_prefs` cookie, and list the user's available targets |
+| `GET /cookie-policy` | Require login; render the static cookie-policy page (read-only, no CSRF) |
 | `POST /connections` | Validate CSRF, call only the safe-request RPC, and redirect to the owned HTML status page |
 | `GET /connections/<uuid>` | Render the owned request state; refresh while provisioning and show the temporary browser URL only while running |
 | `POST /connections/cancel` | Validate CSRF and request cancellation, then redirect back to the HTML status page |
