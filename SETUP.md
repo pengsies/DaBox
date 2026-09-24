@@ -13,6 +13,9 @@ does not contain preloaded multi-gigabyte Docker image layers or generated
 secrets. The Ubuntu VM therefore needs Internet access while the installer
 downloads packages and pulls/builds images.
 
+For recovery of the existing Group 30 EC2, including why each permission and
+service change is made, see `EC2_RECOVERY_AND_UPGRADE.md`.
+
 ## 1. Required files
 
 Distribute these two files together:
