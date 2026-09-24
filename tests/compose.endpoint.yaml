@@ -1,0 +1,36 @@
+name: relayforge-endpoint-test
+
+services:
+  sample-endpoint:
+    image: python:3.12.14-slim-bookworm@sha256:9c47360a2a0355e2da18516d0b1c2126ec22c195d2185e97347c9d98398c5bef
+    platform: linux/amd64
+    command: ["python3", "/sample_endpoint.py"]
+    user: "65532:65532"
+    init: true
+    restart: "no"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 32
+    mem_limit: 64m
+    cpus: 0.25
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./sample_endpoint.py:/sample_endpoint.py:ro
+    tmpfs:
+      - /tmp:uid=65532,gid=65532,mode=0700,size=1m
+    ports:
+      - "127.0.0.1:19001:19001"
+    networks:
+      - endpoint_net
+    healthcheck:
+      test: ["CMD", "python3", "/sample_endpoint.py", "--healthcheck"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
+
+networks:
+  endpoint_net: {}

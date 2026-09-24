@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Log in{% endblock %}
+{% block content %}
+<section class="intro">
+  <p class="eyebrow">START HERE</p>
+  <h1>One portal.<br>One connection.</h1>
+  <p class="muted">Sign in to access your RelayForge dashboard.</p>
+</section>
+<section class="card" aria-labelledby="form-title">
+  <p class="eyebrow">WELCOME BACK</p>
+  <h2 id="form-title">Log in to RelayForge</h2>
+  <p class="muted">Enter your account details to continue.</p>
+  {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+  <form method="post" action="{{ url_for('login') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label for="username">Username</label>
+    <input id="username" name="username" value="{{ username }}" autocomplete="username" maxlength="32" pattern="[a-z][a-z0-9_-]{2,31}" required autofocus>
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" maxlength="256" required>
+    <button class="primary" type="submit">Log in <span aria-hidden="true">→</span></button>
+  </form>
+</section>
+{% endblock %}
+

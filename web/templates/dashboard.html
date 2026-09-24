@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+<section class="dashboard">
+  <div class="dashboard-heading">
+    <div>
+      <p class="eyebrow">YOUR DASHBOARD</p>
+      <h1>Welcome, {{ session.username }}.</h1>
+    </div>
+    <form method="post" action="{{ url_for('logout') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button class="secondary" type="submit">Log out</button>
+    </form>
+  </div>
+  <div class="card connection">
+    <span class="badge">New request</span>
+    <h2>Request a connection</h2>
+    <p class="muted">Submit a validated relay request to an enabled target.</p>
+    {% if backend_error %}
+      <p class="error" role="alert">The relay service is temporarily unavailable.</p>
+    {% elif not targets %}
+      <p class="error" role="alert">No targets are currently available for this account.</p>
+    {% else %}
+      <form method="post" action="{{ url_for('request_connection') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <label for="target">Target</label>
+        <select id="target" name="target" required>
+          {% for target in targets %}
+            <option value="{{ target.id }}">{{ target.display_name }}</option>
+          {% endfor %}
+        </select>
+        <label for="service">Service</label>
+        <input id="service" name="service" value="echo" readonly>
+        <label for="duration">Duration in seconds</label>
+        <input id="duration" name="duration" type="number" value="420" min="30" max="420" required>
+        <button class="primary" type="submit">Submit request <span aria-hidden="true">↗</span></button>
+      </form>
+    {% endif %}
+    <p class="hint">After Access approves the request, RelayForge will display a temporary browser link to the private endpoint.</p>
+  </div>
+</section>
+{% endblock %}

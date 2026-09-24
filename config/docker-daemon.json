@@ -1,0 +1,12 @@
+{
+  "icc": false,
+  "iptables": true,
+  "live-restore": false,
+  "log-driver": "local",
+  "log-opts": {
+    "max-file": "3",
+    "max-size": "10m"
+  },
+  "no-new-privileges": true,
+  "userland-proxy": false
+}

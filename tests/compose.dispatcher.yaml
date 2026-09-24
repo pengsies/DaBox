@@ -1,0 +1,27 @@
+services:
+  dispatcher:
+    volumes:
+      - supervisor_test:/run/relayforge:ro
+    depends_on:
+      fake-supervisor:
+        condition: service_started
+
+  fake-supervisor:
+    build:
+      context: ./control
+    command: ["python3", "/test/fake_supervisor.py"]
+    user: "0:${RELAY_IPC_GID}"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 32
+    mem_limit: 64m
+    network_mode: none
+    volumes:
+      - ./tests/fake_supervisor.py:/test/fake_supervisor.py:ro
+      - supervisor_test:/run/relayforge
+    tmpfs:
+      - /tmp:uid=0,gid=${RELAY_IPC_GID},mode=0700,size=2m
+
+volumes:
+  supervisor_test: {}
