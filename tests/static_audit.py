@@ -10,15 +10,17 @@ import stat
 from pathlib import Path
 
 
-EXPECTED_MARKERS = {
-    "RF-WEB-01",
-    "RF-WEB-02",
-    "RF-DB-01",
-    "RF-PARSE-01",
-    "RF-PARSE-02",
-    "RF-WORKER-01",
-    "RF-WORKER-02",
-    "RF-SUP-01",
+EXPECTED_MARKER_COUNTS = {
+    "RF-WEB-01": 1,
+    "RF-WEB-02": 1,
+    "RF-DB-01": 1,
+    "RF-PARSE-01": 1,
+    "RF-PARSE-02": 1,
+    "RF-WORKER-01": 1,
+    "RF-WORKER-02": 1,
+    # The root-execution marker belongs to both sides of its trust boundary:
+    # the pathname race and the deliberately unrestricted systemd unit.
+    "RF-SUP-ROOT-01": 2,
 }
 PRODUCTION_DIRS = ("web", "control", "db", "worker", "host", "config")
 TEXT_SUFFIXES = {".py", ".php", ".sql", ".in", ".c", ".conf", ".service", ".yaml", ".json", ".ini", ".sh", ".txt"}
@@ -76,10 +78,14 @@ class Audit:
 
     def intentional_surface(self) -> None:
         text = self.production_text()
-        observed = set(re.findall(r"RF-[A-Z]+-[0-9]+", text))
-        self.require(observed == EXPECTED_MARKERS, f"intentional marker set changed: {sorted(observed)}")
-        for marker in EXPECTED_MARKERS:
-            self.require(text.count(marker) == 1, f"intentional marker is not unique: {marker}")
+        observed = set(re.findall(r"RF-[A-Z-]+-[0-9]+", text))
+        expected = set(EXPECTED_MARKER_COUNTS)
+        self.require(observed == expected, f"intentional marker set changed: {sorted(observed)}")
+        for marker, count in EXPECTED_MARKER_COUNTS.items():
+            self.require(
+                text.count(marker) == count,
+                f"intentional marker count changed: {marker}",
+            )
 
     def web(self) -> None:
         application = self.read("web/app/__init__.py")
@@ -229,7 +235,7 @@ class Audit:
         firewall = self.read("host/firewall.py")
         install = self.read("scripts/install.sh")
         verifier = self.read("scripts/verify-hardening.sh")
-        self.require("SO_PEERCRED" in supervisor and "/proc/{pid}/cgroup" in supervisor, "Supervisor does not bind archive RPC to peer/cgroup")
+        self.require("SO_PEERCRED" in supervisor and "/proc/{pid}/cgroup" in supervisor, "Supervisor does not bind diagnose RPC to peer/cgroup")
         self.require("Ed25519PublicKey" in supervisor and "verify_key.verify" in supervisor, "Supervisor does not verify Ed25519 jobs")
         self.require("set(message) != {\"op\", \"payload\", \"signature_hex\"}" in supervisor, "launch RPC schema is not exact")
         self.require(
@@ -256,11 +262,66 @@ class Audit:
             and 'f"target_port={job.endpoint_port}\\n"' in supervisor,
             "Supervisor does not hand the signed endpoint to the Worker config",
         )
-        self.require("checked = path.lstat()" in supervisor and "time.sleep(ARCHIVE_DELAY_SECONDS)" in supervisor and "os.open(path, flags)" in supervisor, "documented Supervisor race primitive changed")
-        self.require("_peer_in_job(peer_pid, active.unit)" in supervisor, "archive does not require the caller's exact Worker cgroup")
-        self.require("CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH" in supervisor_unit, "Supervisor has an unexpected capability boundary")
-        for hardening in ("ProtectSystem=strict", "NoNewPrivileges=yes", "PrivateDevices=yes", "MemoryDenyWriteExecute=yes", "RestrictNamespaces=yes"):
-            self.require(hardening in supervisor_unit, f"Supervisor unit lacks {hardening}")
+        self.require(
+            'set(message) != {"op", "job_id", "name"}' in supervisor
+            and 'message.get("op") != "diagnose"' in supervisor
+            and 'name != DIAGNOSTIC_NAME' in supervisor
+            and 'operation == "diagnose" and peer_uid == supervisor.relay_uid' in supervisor,
+            "diagnose RPC schema, fixed name, or kernel-UID gate changed",
+        )
+        self.require(
+            "_peer_in_job(peer_pid, active.unit)" in supervisor,
+            "diagnose does not require the caller's exact active Worker cgroup",
+        )
+        self.require(
+            "getattr(os, \"O_NOFOLLOW\", 0)" in supervisor
+            and "checked = os.fstat(descriptor)" in supervisor
+            and "checked.st_uid != self.relay_uid" in supervisor
+            and "checked.st_nlink != 1" in supervisor
+            and "stat.S_IMODE(checked.st_mode) != DIAGNOSTIC_MODE" in supervisor
+            and "checked.st_size != len(DIAGNOSTIC_SCRIPT)" in supervisor
+            and "data != DIAGNOSTIC_SCRIPT" in supervisor,
+            "diagnose pre-race script validation changed",
+        )
+        acknowledgement = 'connection.sendall(canonical_response({"ok": True, "state": "validated"}))'
+        delay = "time.sleep(DIAGNOSTIC_DELAY_SECONDS)"
+        execution = "process = subprocess.Popen("
+        self.require(
+            acknowledgement in supervisor
+            and delay in supervisor
+            and execution in supervisor
+            and supervisor.index(acknowledgement) < supervisor.index(delay) < supervisor.index(execution)
+            and "[os.fspath(path)]" in supervisor
+            and "stdin=connection" in supervisor
+            and "stdout=connection" in supervisor
+            and "stderr=connection" in supervisor
+            and "min(DIAGNOSTIC_MAX_SECONDS, remaining)" in supervisor,
+            "documented acknowledged pathname re-execution primitive changed",
+        )
+        for weakening in (
+            "NoNewPrivileges=no",
+            "PrivateDevices=no",
+            "PrivateIPC=no",
+            "PrivateTmp=no",
+            "ProtectHome=no",
+            "ProtectSystem=no",
+            "RestrictNamespaces=no",
+            "RestrictSUIDSGID=no",
+            "MemoryDenyWriteExecute=no",
+            "LockPersonality=no",
+        ):
+            self.require(
+                weakening in supervisor_unit,
+                f"unrestricted-root challenge unit no longer declares {weakening}",
+            )
+        self.require(
+            re.search(
+                r"^\s*(?:CapabilityBoundingSet|AmbientCapabilities)=",
+                supervisor_unit,
+                re.MULTILINE,
+            ) is None,
+            "Supervisor root capability set is unexpectedly bounded",
+        )
         self.require("argc != 3" in worker and "usage: relay-worker PORT CONFIG" in worker, "Worker argv contains more than port/config")
         self.require(
             'copy_config_value(stream, "target_host="' in worker
@@ -296,6 +357,12 @@ class Audit:
         self.require(
             "player_cidr=${PLAYER_CIDR:-0.0.0.0/0}" in install,
             "installer does not default the public CTF player surface to all IPv4",
+        )
+        self.require(
+            "--acknowledge-unrestricted-root" in install
+            and "acknowledge_unrestricted_root -ne 1" in install
+            and "REFUSING INSTALL" in install,
+            "installer does not require explicit acknowledgement of unrestricted host root",
         )
         self.require(
             '"--uid-owner"' in firewall
@@ -342,9 +409,21 @@ class Audit:
             "full-chain verifier omits Worker negative/tunnel checks",
         )
         self.require("relay could read the root flag directly" in full_chain, "full-chain verifier omits direct-read denial")
-        self.require("race_rc != 0 or flag_match is None" in full_chain, "full-chain verifier can report a false-positive race")
+        self.require(
+            "ROOT_UID_PROOF_RE.search(race_output)" in full_chain
+            and "ROOT_FLAG_PROOF_RE.search(race_output)" in full_chain
+            and "race_rc != 0 or uid_match is None or flag_match is None" in full_chain,
+            "full-chain verifier can report a false-positive root diagnostic race",
+        )
         self.require("return 1" in full_chain and "return 1" in race, "attack tooling does not fail closed")
-        self.require("os.replace(swap_path, race_path)" in race, "race exploit does not perform atomic pathname replacement")
+        self.require(
+            'acknowledgement.get("ok") is not True' in race
+            and 'acknowledgement.get("state") != "validated"' in race
+            and "os.replace(replacement_path, race_path)" in race
+            and "PROOF_UID_RE.search(transcript)" in race
+            and "PROOF_FLAG_RE.search(transcript)" in race,
+            "diagnostic exploit does not synchronize, replace atomically, and prove UID 0 plus flag read",
+        )
 
     def run(self) -> int:
         self.filesystem()

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Test canonical signed-job validation and the production archive race."""
+"""Test signed-job validation and the production diagnostic execution race."""
 
 from __future__ import annotations
 
-import base64
 import json
 import os
+import socket
 import sys
 import tempfile
 import threading
@@ -154,14 +154,22 @@ def test_signature_validation() -> None:
     )
 
 
-def test_archive_controls_and_race() -> None:
+def _recv_line(client: socket.socket) -> bytes:
+    data = bytearray()
+    while not data.endswith(b"\n"):
+        chunk = client.recv(4096)
+        if not chunk:
+            break
+        data.extend(chunk)
+    return bytes(data)
+
+
+def test_diagnostic_controls_and_race() -> None:
     with tempfile.TemporaryDirectory(prefix="relayforge-supervisor-") as name:
         root = Path(name)
         run_dir = root / "job"
         work = run_dir / "work"
         work.mkdir(parents=True)
-        secret = root / "root-only.txt"
-        secret.write_bytes(b"RF{0123456789abcdef0123456789abcdef}\n")
         job_id = str(uuid.uuid4())
         active = module.ActiveJob(
             job_id,
@@ -177,33 +185,135 @@ def test_archive_controls_and_race() -> None:
         broker._unit_active = lambda _unit: True
         broker._peer_in_job = lambda _pid, _unit: True
 
-        request = {"op": "archive", "job_id": job_id, "name": "race.log"}
-        race_path = work / "race.log"
-        race_path.write_bytes(b"decoy\n")
-        swap = work / ".swap"
-        swap.symlink_to(secret)
+        request = {"op": "diagnose", "job_id": job_id, "name": "diagnostic.sh"}
+        race_path = work / "diagnostic.sh"
+        race_path.write_bytes(module.DIAGNOSTIC_SCRIPT)
+        race_path.chmod(module.DIAGNOSTIC_MODE)
+        swap = work / ".replacement"
+        swap.write_bytes(
+            b"#!/bin/sh\n"
+            b"printf 'replacement-executed uid=%s\\n' \"$(id -u)\"\n"
+        )
+        swap.chmod(module.DIAGNOSTIC_MODE)
 
-        def replace_checked_path() -> None:
-            time.sleep(0.030)
-            os.replace(swap, race_path)
+        server, client = socket.socketpair()
+        client.settimeout(2)
+        failures: list[Exception] = []
 
-        thread = threading.Thread(target=replace_checked_path)
+        def run_diagnostic() -> None:
+            try:
+                broker.run_diagnostic(request, os.getpid(), server)
+            except Exception as exc:  # surfaced in the main test thread
+                failures.append(exc)
+            finally:
+                server.close()
+
+        thread = threading.Thread(target=run_diagnostic)
         thread.start()
-        reply = broker.archive_file(request, os.getpid())
-        thread.join(timeout=1)
-        assert base64.b64decode(reply["data_b64"], validate=True) == secret.read_bytes()
+        validated = json.loads(_recv_line(client))
+        assert validated == {"ok": True, "state": "validated"}
+        os.replace(swap, race_path)
+        output = _recv_line(client)
+        client.close()
+        thread.join(timeout=3)
+        assert not thread.is_alive()
+        assert failures == []
+        assert output == f"replacement-executed uid={os.geteuid()}\n".encode("ascii")
+
+        race_path.write_bytes(module.DIAGNOSTIC_SCRIPT)
+        race_path.chmod(0o600)
+        server, client = socket.socketpair()
+        try:
+            expect_error(
+                lambda: broker.run_diagnostic(request, os.getpid(), server),
+                module.ProtocolError,
+            )
+        finally:
+            server.close()
+            client.close()
 
         race_path.unlink()
-        race_path.symlink_to(secret)
-        expect_error(lambda: broker.archive_file(request, os.getpid()), module.ProtocolError)
-        expect_error(
-            lambda: broker.archive_file(
-                {"op": "archive", "job_id": job_id, "name": "../root-only.txt"}, os.getpid()
-            ),
-            module.ProtocolError,
-        )
+        race_path.symlink_to(root / "missing")
+        server, client = socket.socketpair()
+        try:
+            expect_error(
+                lambda: broker.run_diagnostic(request, os.getpid(), server),
+                OSError,
+            )
+        finally:
+            server.close()
+            client.close()
+        race_path.unlink()
+        race_path.write_bytes(module.DIAGNOSTIC_SCRIPT)
+        race_path.chmod(module.DIAGNOSTIC_MODE)
+        server, client = socket.socketpair()
+        try:
+            expect_error(
+                lambda: broker.run_diagnostic(
+                    {"op": "diagnose", "job_id": job_id, "name": "../root-only.sh"},
+                    os.getpid(),
+                    server,
+                ),
+                module.ProtocolError,
+            )
+            expect_error(
+                lambda: broker.run_diagnostic(
+                    {**request, "extra": True}, os.getpid(), server
+                ),
+                module.ProtocolError,
+            )
+            expect_error(
+                lambda: broker.run_diagnostic(
+                    {**request, "name": "other.sh"}, os.getpid(), server
+                ),
+                module.ProtocolError,
+            )
+        finally:
+            server.close()
+            client.close()
+
         broker._peer_in_job = lambda _pid, _unit: False
-        expect_error(lambda: broker.archive_file(request, os.getpid()), PermissionError)
+        server, client = socket.socketpair()
+        try:
+            expect_error(
+                lambda: broker.run_diagnostic(request, os.getpid(), server),
+                PermissionError,
+            )
+        finally:
+            server.close()
+            client.close()
+
+
+def test_diagnostic_rejects_unauthorized_kernel_uid() -> None:
+    broker = module.Supervisor.__new__(module.Supervisor)
+    broker.dispatch_uid = 12001
+    broker.relay_uid = 12002
+    called = False
+
+    def unexpected_diagnostic(*_arguments: object) -> None:
+        nonlocal called
+        called = True
+
+    broker.run_diagnostic = unexpected_diagnostic
+    previous_credentials = module._peer_credentials
+    previous_reader = module._read_request
+    module._peer_credentials = lambda _connection: (4321, 12003, 12003)
+    module._read_request = lambda _connection: {
+        "op": "diagnose",
+        "job_id": str(uuid.uuid4()),
+        "name": "diagnostic.sh",
+    }
+    server, client = socket.socketpair()
+    client.settimeout(2)
+    try:
+        module.handle_connection(broker, server)
+        reply = json.loads(_recv_line(client))
+    finally:
+        client.close()
+        module._peer_credentials = previous_credentials
+        module._read_request = previous_reader
+    assert reply == {"error": "PermissionError", "ok": False}
+    assert called is False
 
 
 def test_confirmed_idempotent_stop() -> None:
@@ -243,9 +353,10 @@ def main() -> None:
     test_job_validation()
     test_worker_config_contains_signed_destination()
     test_signature_validation()
-    test_archive_controls_and_race()
+    test_diagnostic_controls_and_race()
+    test_diagnostic_rejects_unauthorized_kernel_uid()
     test_confirmed_idempotent_stop()
-    print("PASS: Supervisor launch/stop/archive gates hold; intended TOCTOU is exploitable")
+    print("PASS: Supervisor launch/stop/diagnose gates hold; root-exec TOCTOU is reachable")
 
 
 if __name__ == "__main__":

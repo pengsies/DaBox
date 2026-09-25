@@ -71,6 +71,13 @@ The Worker is intentionally **not** a Docker service. A real accepted request
 causes the Supervisor to create a transient systemd Worker listening on one
 host port from `25000-25099`.
 
+The final escalation is likewise not a Docker escape. After the player gains a
+sandboxed `relay` shell in that native Worker, the host-root Supervisor's
+intentional diagnostic TOCTOU executes a replacement pathname as UID 0. In this
+variant the Supervisor service is deliberately unrestricted, so success means
+real root on the Ubuntu host. See `UNRESTRICTED_ROOT_WARNING.md` before running
+it.
+
 ## Test-only containers
 
 The acceptance suites may also create a disposable `sample-endpoint`, a

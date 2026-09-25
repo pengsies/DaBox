@@ -1,8 +1,16 @@
 # RelayForge EC2 recovery and in-place upgrade guide
 
-This runbook brings the existing Group 30 EC2 deployment back to a known-good
-state without deleting its PostgreSQL volume, generated secrets, or root flag.
-It applies to the bounded Flask variant in this directory.
+> **STOP for this branch:** the instructions below document recovery of the
+> older bounded flag-disclosure deployment. This unrestricted-root branch must
+> **not** be installed in place on the shared Group 30 EC2. A solver can take
+> full control of the host. Provision a new disposable, single-player instance
+> with no IAM role or valuable data and follow `SETUP.md` instead. Preserve this
+> runbook only as history for maintaining or rolling back the bounded build.
+
+This historical runbook brings the existing Group 30 bounded deployment back
+to a known-good state without deleting its PostgreSQL volume, generated
+secrets, or root flag. It does not authorize applying the current
+unrestricted-root branch to that shared instance.
 
 Commands are divided between the administrator's computer and the EC2 SSH
 session. Run each command only on the machine named by its section.
@@ -309,12 +317,17 @@ file-level other-read bit without breaking Access. The installer deliberately
 rejects an existing private key with unsafe permissions, so this repair must
 happen before step 8.
 
-## 8. Run the in-place installer
+## 8. Historical bounded-build installer step — do not use for this branch
+
+Do not run this unrestricted-root branch on the existing shared EC2. The
+acknowledgement flag below is appropriate only on a newly provisioned,
+disposable instance.
 
 From the fresh extracted directory:
 
 ```bash
 sudo ./scripts/install.sh \
+  --acknowledge-unrestricted-root \
   --player-cidr 0.0.0.0/0 \
   --public-interface ens5 \
   --admin-user student30 \
@@ -326,6 +339,7 @@ Argument meanings:
 
 | Argument | Meaning on this EC2 |
 |---|---|
+| `--acknowledge-unrestricted-root` | Accepts that a participant can execute arbitrary commands as host UID 0; never use it on a shared or valuable host. |
 | `--player-cidr 0.0.0.0/0` | Ubuntu permits portal and Worker traffic from any IPv4 source that AWS also allows. |
 | `--public-interface ens5` | Public traffic arrives at the instance through `ens5`. |
 | `--admin-user student30` | SSH hardening preserves key-only administration for this account. |
@@ -392,12 +406,14 @@ Expected results:
 
 - the stack unit is `active (exited)`;
 - exactly five containers are `Up` and `healthy`;
-- hardening reports zero failures;
+- deployment verification reports zero failures, including the explicit
+  unrestricted-Supervisor assertion;
 - both local health requests succeed; and
 - Worker strings include both `HTTP/1.1` and `/relay/`.
 
-Hardening proves permissions and isolation. It does not prove that the
-intended vulnerability reaches the flag.
+Verification proves the remaining permissions and isolation and confirms that
+the Supervisor is deliberately unrestricted. It does not by itself prove that
+the intended vulnerability reaches UID 0.
 
 ## 11. Run complete application acceptance
 
@@ -414,8 +430,8 @@ This runs:
 - `full_chain.py`, which exercises the intentional Web, database, Worker, and
   Supervisor vulnerabilities.
 
-A complete pass prints a generated `RF{...}` value. Do not copy that value
-into source control.
+A complete pass proves `ROOT_UID=0` and prints a generated `RF{...}` value. Do
+not copy that value into source control. Destroy/reimage the VM afterward.
 
 ## 12. Test from a participant browser
 

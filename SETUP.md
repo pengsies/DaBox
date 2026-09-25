@@ -1,5 +1,10 @@
 # RelayForge Windows-to-Ubuntu setup and acceptance guide
 
+> **Unrestricted-root variant:** a successful player obtains real UID 0 on the
+> Ubuntu host. Use a disposable, single-player VM with no IAM role, reusable
+> credentials, sensitive data, or other workloads. Do not install this branch
+> on the shared Group 30 EC2. Read `UNRESTRICTED_ROOT_WARNING.md` first.
+
 This is the authoritative setup guide for the bounded-lifetime Flask release.
 The RelayForge host must be a native **Ubuntu Server 24.04.x LTS AMD64**
 installation. Ubuntu Desktop, WSL2, and Docker Desktop are not acceptance
@@ -282,6 +287,7 @@ in the previous section:
 
 ```bash
 sudo ./scripts/install.sh \
+  --acknowledge-unrestricted-root \
   --player-cidr 0.0.0.0/0 \
   --public-interface "$PUBLIC_IFACE" \
   --admin-user "$ADMIN_USER" \
@@ -328,6 +334,7 @@ from a newly verified and newly extracted release:
 ```bash
 sudo systemctl list-units --state=running --type=service 'relay-worker-*'
 sudo ./scripts/install.sh \
+  --acknowledge-unrestricted-root \
   --player-cidr 0.0.0.0/0 \
   --public-interface "$PUBLIC_IFACE" \
   --admin-user "$ADMIN_USER" \
@@ -362,7 +369,7 @@ curl --fail http://127.0.0.1:19001/health
 curl --fail --insecure https://127.0.0.1/healthz
 ```
 
-Acceptance requires zero hardening failures, five healthy containers, all
+Acceptance requires zero deployment-verification failures, five healthy containers, all
 listed host services active, and both health requests succeeding.
 
 For a host-local functional run, use:
@@ -429,16 +436,17 @@ endpoint through both paths, rejects shortcut attacks, and cancels the Worker.
 `full_chain.py` verifies the authenticated Flask foothold, restricted
 database RPC, Access signature, Dispatcher, real Worker tunnel and intended
 Worker/Supervisor challenge chain. It succeeds only after printing an
-`RF{...}` flag.
+`ROOT_UID=0` proof and an `RF{...}` flag read through that root process.
 
 The release is fully accepted only when all of these are true:
 
 1. Release checksum, manifest, stage, and ZIP verifier pass.
 2. Optional disposable suites contain no failures.
-3. Installed hardening reports zero failures and five containers are healthy.
+3. Installed verification reports zero failures and confirms both the hardened
+   Worker boundary and the deliberately unrestricted Supervisor boundary.
 4. A real `relay-worker-<uuid>.service` and port appear during a request.
 5. Windows `negative_paths.py` passes its actual tunnel test.
-6. Windows `full_chain.py` prints the flag.
+6. Windows `full_chain.py` proves UID 0 and prints the flag.
 
 ## 12. Troubleshooting
 
@@ -498,7 +506,8 @@ RelayForge Docker volume. Do not use `docker system prune -a --volumes`,
 
 `sudo /opt/relayforge/runtime/reset-lab.sh --yes` is a destructive challenge
 reset, not cleanup: it removes the PostgreSQL volume and Worker state and
-rotates the flag. Use it only when a deliberate fresh challenge is required.
+rotates the flag. It is not trustworthy remediation after a player has reached
+unrestricted root; destroy and recreate that VM from a known-good image.
 
 ## Official platform references
 

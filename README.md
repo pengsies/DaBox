@@ -1,4 +1,9 @@
-# RelayForge bounded Flask integration
+# RelayForge unrestricted-root Flask challenge
+
+> **Danger:** the intended final stage provides unrestricted UID-0 command
+> execution on the Ubuntu host. Deploy only to a disposable, single-player VM
+> with no IAM role, reusable credentials, sensitive data, or other workloads.
+> Read `UNRESTRICTED_ROOT_WARNING.md` before installation.
 
 This directory is a self-contained deployment root for the bounded-lifetime
 RelayForge variant. Its public Web application is Flask served by Gunicorn
@@ -27,7 +32,8 @@ The authenticated Flask `remember_prefs` deserialization flaw is the intended
 first foothold. It runs commands only as the unprivileged Web UID. The intended
 chain then invokes the otherwise non-public raw-request RPC, reaches the
 Access/Worker parser differential, exploits the legacy Worker callback, and
-finishes at the Supervisor archive race.
+finishes by racing a validated diagnostic pathname into an unrestricted host
+root shell.
 
 ## Directory map
 
@@ -47,6 +53,7 @@ finishes at the Supervisor archive race.
 | `CONTRACTS.md` | Exact DB, signed-job, Unix-RPC, Worker, cancellation, and endpoint contracts |
 | `WEB_REQUIRED.md` | Implemented Flask-specific Web contract |
 | `SETUP.md` | Windows VM creation, Ubuntu Server installer choices, deployment, and acceptance |
+| `UNRESTRICTED_ROOT_WARNING.md` | Mandatory deployment-risk and disposal guidance for this branch |
 | `EC2_RECOVERY_AND_UPGRADE.md` | Current-EC2 repair, upgrade rationale, verification, and recovery procedure |
 | `DOCKER_COMPONENTS.md` | Exact five-container inventory and host/container boundary |
 
@@ -72,11 +79,12 @@ DB/Access/Dispatcher test. It does not claim that a real tunnel was created.
 The endpoint suite launches the real Worker directly and proves both the raw
 CONNECT tunnel and browser HTTP path to the sample private endpoint.
 
-The real signed Supervisor-to-Worker and complete flag chain require a clean
+The real signed Supervisor-to-Worker and complete UID-0 chain require a clean
 Ubuntu 24.04 AMD64 VM with systemd:
 
 ```bash
 sudo ./scripts/install.sh \
+  --acknowledge-unrestricted-root \
   --player-cidr 0.0.0.0/0 \
   --public-interface <interface> \
   --admin-user <user> \
@@ -106,6 +114,8 @@ reliably run systemd.
 - Dispatcher forwards the exact signed payload without reserializing it.
 - Worker has no database credential and can reach only the configured canonical
   IPv4/port endpoint under the host firewall policy.
+- The root Supervisor deliberately runs without its former systemd sandbox so
+  the final diagnostic race produces genuine, unrestricted host root.
 - A relay lasts its requested 30–420 seconds. An authenticated owner can also
   request cancellation; Dispatcher retries until Supervisor confirms stop.
 - `options_raw` controls only the safe/legacy parser exercise and never routing.
@@ -133,6 +143,9 @@ then verify its contents and internal checksums:
 python3 tests/verify-release-bundle.py \
   /path/to/output/RelayForge-Responsibilities-Flask-v1.zip
 ```
+
+This organizer bundle contains a working host-root exploit. Do not distribute
+it unchanged to participants and do not install it on a shared EC2 instance.
 
 `MANIFEST.sha256` protects the checked-in integration tree. The release script
 generates a fresh archive-local manifest after filtering generated files and

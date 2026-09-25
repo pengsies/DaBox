@@ -110,6 +110,18 @@ def main() -> int:
         expected_http(authenticated, f"{base}/api/status/{uuid.uuid4()}", 404)
         expected_http(authenticated, f"{base}/api/result?name=../root.txt", 400)
         expected_http(authenticated, f"{base}/var/cache/{'0' * 32}.txt", 404)
+        expected_http(
+            authenticated,
+            json_post(
+                f"{base}/api/diagnose",
+                {
+                    "op": "diagnose",
+                    "job_id": str(uuid.uuid4()),
+                    "name": "diagnostic.sh",
+                },
+            ),
+            404,
+        )
         malformed_cookie = urllib.request.Request(
             f"{base}/dashboard",
             headers={"Cookie": chain._remember_cookie_header(authenticated, "not-base64")},
@@ -182,7 +194,7 @@ def main() -> int:
         return 1
     suffix = " (external-port checks skipped for loopback target)" if local_target else ""
     print(
-        "PASS: unauthenticated, CSRF, wrong-token, safe-Worker, cache, "
+        "PASS: unauthenticated, CSRF, public-diagnose, wrong-token, safe-Worker, cache, "
         f"and internal-port shortcuts denied{suffix}"
     )
     return 0

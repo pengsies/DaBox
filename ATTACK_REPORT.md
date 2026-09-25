@@ -1,7 +1,7 @@
-# RelayForge bounded Flask attack and adversarial review
+# RelayForge bounded-lifetime unrestricted-root attack review
 
-Version: 1.1
-Report date: 2026-09-24
+Version: 2.0-unrestricted-root
+Report date: 2026-09-25
 
 ## Scope
 
@@ -25,14 +25,17 @@ known guest login
   -> Ed25519-signed transient Worker
   -> token-gated Worker PIE leak and bounded callback overwrite
   -> host shell as the unprivileged relay user
-  -> active-Worker-cgroup archive RPC
+  -> active-Worker-cgroup diagnostic RPC
   -> root Supervisor pathname TOCTOU
-  -> disclosure of the root-only flag
+  -> unrestricted UID-0 shell on the Ubuntu host
+  -> direct root-flag read
 ```
 
-The final result is disclosure of `/var/lib/relayforge/flag/root.txt`. The
-intended solution does not grant UID 0, unrestricted `sudo`, or a persistent
-root shell.
+The final result is genuine, unrestricted host-root command execution and a
+direct read of `/var/lib/relayforge/flag/root.txt`. This is not container root
+and not a narrow flag-reading deputy. A solver can alter the VM, Docker,
+firewall, accounts, and services, so the instance must be disposable and
+single-player.
 
 ## Starting position
 
@@ -55,7 +58,7 @@ filesystem access. The internal HTTP endpoint is not published directly.
 | RF-PARSE-02 | Worker | Runtime behavior uses the last `profile` value | Cross-component parser differential |
 | RF-WORKER-01 | Worker | A bounded 136-byte copy may overwrite a callback after a 128-byte buffer | Controlled memory corruption without an unbounded copy |
 | RF-WORKER-02 | Worker | Legacy mode discloses the live `worker_shell` address | Demonstrate a PIE information leak |
-| RF-SUP-01 | Supervisor | A root process validates a pathname, delays, and then reopens it | Privileged validation/use race |
+| RF-SUP-ROOT-01 | Supervisor | A root process validates one exact benign diagnostic, acknowledges it, delays, then executes the pathname again | Privileged validation/use race to real host root |
 
 These are dependencies in one intended chain, not independent public routes to
 the flag.
@@ -188,25 +191,34 @@ active transient Worker unit and its systemd sandbox.
 
 Primitive gained: command execution as the unprivileged host `relay` user.
 
-### 6. Race the root Supervisor archive operation
+### 6. Race the root Supervisor diagnostic operation
 
 Directly reading `/var/lib/relayforge/flag/root.txt` as `relay` must fail. The
-archive operation additionally accepts only UID `relay` from the exact active
-Worker cgroup for the supplied job UUID.
+diagnostic operation additionally accepts only UID `relay` from the exact
+active Worker cgroup for the supplied job UUID.
 
-The attacker creates an owned regular `race.log` in the active Worker's work
-directory and requests that it be archived. Supervisor first calls `lstat()`
-and checks that the object is a relay-owned, single-link regular file no larger
-than 4096 bytes.
+The attacker creates `diagnostic.sh` in the active Worker's work directory as a
+relay-owned, single-link, mode-`0700` regular file containing exactly:
+
+```sh
+#!/bin/sh
+printf 'RelayForge diagnostic OK\n'
+```
+
+The shell sends the exact `diagnose` request. Supervisor opens the file with
+`O_NOFOLLOW`, checks its metadata and bytes through that descriptor, closes it,
+and returns `{"ok":true,"state":"validated"}`.
 
 The intentional flaw is that validation and use do not share an open file
-descriptor. During the deterministic 100 ms delay, the attacker atomically
-replaces the checked pathname with a symlink to the root flag. Supervisor then
-calls `os.open(path, ...)` without `O_NOFOLLOW`, follows the replacement link as
-root, and returns up to 4096 bytes as base64.
+descriptor. During the deterministic 250 ms delay, the attacker atomically
+replaces the checked pathname with an executable script that launches `/bin/sh`.
+Supervisor then executes that pathname as UID 0 with the same Unix socket as
+stdin, stdout, and stderr.
 
-Primitive gained: disclosure of the root-only flag through a privileged
-confused deputy. The attacker still does not obtain a root shell.
+Primitive gained: an interactive, unrestricted host-root command stream for up
+to the lesser of 60 seconds and the Worker's remaining lifetime. Reading the
+flag is now an ordinary root operation, for example `id` followed by
+`cat /var/lib/relayforge/flag/root.txt`.
 
 ## Why the ordering is enforced
 
@@ -220,8 +232,10 @@ confused deputy. The attacker still does not obtain a root shell.
 - Debug commands require both the parser differential and the random Worker
   token.
 - Worker command execution is `relay`, not root, and the unit is sandboxed.
-- Archive additionally checks the caller's live Worker cgroup.
-- Only the final pathname race lets root-only data cross the privilege boundary.
+- Diagnose additionally checks the caller's live Worker cgroup and an exact
+  benign script before acknowledging the race window.
+- Only the final pathname race crosses from the sandboxed `relay` Worker to
+  unrestricted host root.
 
 ## Browser usability versus attack protocol
 
@@ -244,17 +258,16 @@ Current source-level and local component evidence includes:
 - Flask authentication, restricted-pickle, CSRF, and result-path tests;
 - Web database-role and raw-RPC boundary checks;
 - Access first-profile and Worker last-profile behavior;
-- canonical signing, Dispatcher, Supervisor, archive-gate, and TOCTOU tests;
+- canonical signing, Dispatcher, Supervisor, diagnostic-gate, and root-exec
+  TOCTOU tests;
 - production Worker compilation, wrong-token rejection, browser forwarding,
   real `CONNECT` tunnelling, PIE leak, callback overwrite, and relay shell; and
 - shell syntax and Compose-model validation.
 
-The EC2 deployment has separately shown a healthy five-container stack and a
-46/46 host-hardening verification result. That does not by itself prove the
-complete attack chain. A successful current `tests/run-vm.sh` execution ending
-in an exact root flag must be recorded before claiming a complete deployed-VM
-PASS. Earlier partial EC2 attempts and failures must not be presented as full
-chain success.
+Historical EC2 results for the bounded disclosure build do not prove this
+unrestricted-root variant. A successful current `tests/run-vm.sh` execution
+that proves `uid=0` and reads the exact root flag on a fresh disposable VM must
+be recorded before claiming a complete deployed-VM PASS.
 
 ## Operational and adversarial notes
 
@@ -262,13 +275,14 @@ chain success.
   maintainer material private if participants are expected to discover it.
 - The root flag is generated per deployment and rotated by the reset script;
   no real flag value is committed to source.
-- The race is probabilistic by design, although the fixed delay and retrying
-  helper make it suitable for a teaching environment.
-- Session limits, finite Worker lifetimes, cancellation, firewall restrictions,
-  container isolation, and systemd sandboxing reduce unintended shortcuts and
-  persistence but are not substitutes for running the lab on a disposable host.
-- Never deploy this intentionally vulnerable stack alongside real data,
-  credentials, or a privileged EC2 instance role.
+- The acknowledgement and fixed delay make the intended pathname replacement
+  deterministic enough for a teaching environment.
+- Worker sandboxing and the pre-final-stage trust boundaries still prevent
+  unintended shortcuts. The Supervisor itself is deliberately not sandboxed,
+  because the selected learning outcome is genuine host root.
+- Never deploy this stack alongside real data, credentials, other workloads,
+  or any EC2 instance role. Destroy/reimage it after a solver reaches root;
+  `reset-lab.sh` is not a security boundary against unrestricted UID 0.
 
 For a participant-oriented walkthrough, including the exact container-to-host
 trust-boundary transitions, see `PLAYER_ATTACK_GUIDE.md`.

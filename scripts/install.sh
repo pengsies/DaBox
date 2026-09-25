@@ -10,6 +10,7 @@ endpoint_host=${RELAY_ENDPOINT_HOST:-127.0.0.1}
 endpoint_port=${RELAY_ENDPOINT_PORT:-19001}
 defer_firewall=0
 defer_ssh=0
+acknowledge_unrestricted_root=0
 
 usage() {
   cat >&2 <<'USAGE'
@@ -22,6 +23,9 @@ usage: sudo scripts/install.sh [options]
   --endpoint-port PORT    approved HTTP endpoint port (default: 19001)
   --defer-firewall        install/build but do not start the challenge
   --defer-ssh-hardening   leave SSH policy unchanged (verification will fail)
+  --acknowledge-unrestricted-root
+                          REQUIRED: confirm this CTF deliberately grants an
+                          attacker unrestricted UID-0 execution on the host
 
 Values may instead be supplied as PLAYER_CIDR, PUBLIC_IFACE,
 ADMIN_USER, RELAY_ENDPOINT_HOST, and RELAY_ENDPOINT_PORT environment variables.
@@ -38,6 +42,7 @@ while [[ $# -gt 0 ]]; do
     --endpoint-port) [[ $# -ge 2 ]] || usage; endpoint_port=$2; shift 2 ;;
     --defer-firewall) defer_firewall=1; shift ;;
     --defer-ssh-hardening) defer_ssh=1; shift ;;
+    --acknowledge-unrestricted-root) acknowledge_unrestricted_root=1; shift ;;
     -h|--help) usage ;;
     *) usage ;;
   esac
@@ -46,6 +51,12 @@ done
 if [[ ${EUID} -ne 0 ]]; then
   echo "Run the installer as root (normally with sudo)." >&2
   exit 1
+fi
+if [[ $acknowledge_unrestricted_root -ne 1 ]]; then
+  echo "REFUSING INSTALL: this branch intentionally provides unrestricted host-root code execution." >&2
+  echo "Use only a disposable, single-player VM with no IAM role, credentials, or valuable data." >&2
+  echo "Rerun with --acknowledge-unrestricted-root only after accepting that risk." >&2
+  exit 64
 fi
 if [[ $(uname -m) != x86_64 ]]; then
   echo "RelayForge requires an AMD64 host." >&2
@@ -351,6 +362,7 @@ temporary=$(mktemp /etc/relayforge/.install.state.XXXXXX)
   printf 'FIREWALL_DEFERRED=%s\n' "$defer_firewall"
   printf 'SSH_DEFERRED=%s\n' "$defer_ssh"
   printf 'ADMIN_USER=%s\n' "$admin_user"
+  printf 'UNRESTRICTED_ROOT_ACK=1\n'
 } >"$temporary"
 install -o root -g root -m 0600 "$temporary" /etc/relayforge/install.state
 rm -f -- "$temporary"
@@ -375,7 +387,7 @@ if [[ $defer_firewall -eq 1 ]]; then
   systemctl disable --now relayforge-stack.service relayforge-firewall.service \
     relay-supervisor.service relay-backend.service 2>/dev/null || true
   echo "Installed and built, but intentionally left stopped until firewall configuration is supplied."
-  echo "Hardening verification will fail while FIREWALL_DEFERRED=1."
+  echo "Deployment verification will fail while FIREWALL_DEFERRED=1."
   exit 0
 fi
 
@@ -385,4 +397,4 @@ systemctl restart relay-backend.service relay-supervisor.service
 systemctl restart relayforge-firewall.service
 systemctl restart relayforge-stack.service
 /opt/relayforge/runtime/verify-hardening.sh
-echo "RelayForge installation and hardening verification completed."
+echo "RelayForge unrestricted-root installation and deployment verification completed."

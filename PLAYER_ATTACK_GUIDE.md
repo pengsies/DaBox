@@ -1,7 +1,8 @@
 # RelayForge beginner player and attack guide
 
 > **Full solution spoilers:** This guide explains the complete intended path
-> to the root flag. Give it to learners as a walkthrough or reveal it after
+> to unrestricted host root and the root flag. Give it to learners as a
+> walkthrough or reveal it after
 > the exercise. Do not include it in a blind competition handout unless the
 > solution is meant to be open-book.
 
@@ -19,19 +20,20 @@ Username: guest
 Password: guest-relay-2026
 ```
 
-The objective is to disclose the generated flag matching:
+The objective is to obtain a real UID-0 shell on the Ubuntu host and disclose
+the generated flag matching:
 
 ```text
 RF{32-lowercase-hex-characters}
 ```
 
-The intended result is the flag, not a root shell. The final bug tricks a root
-service into reading one root-only file.
+The final shell is unrestricted host root, not container root and not a
+flag-only helper. Use only the disposable instance assigned for this exercise.
 
 An IP and login are enough to exercise the legitimate browser tunnel, but
 they are not enough teaching material for a beginner to independently infer
 the exact pickle gadget names, duplicate-key parser mismatch, token-gated
-Worker line protocol and binary overflow payload, and 100 ms race. For a
+Worker line protocol and binary overflow payload, and diagnostic race. For a
 guided exercise, also provide either:
 
 - this walkthrough and the extracted release's `attacks/` and `web/tools/`
@@ -103,14 +105,14 @@ Docker: nginx -> Flask Web (UID 65532)
                          v
 Ubuntu host: root Supervisor -> transient Worker (UID relay)
                                       ^              |
-                                      | public port  | archive request
+                                      | public port  | diagnose request
                                       +--------------+
                                                      |
                                                      v
-                              root Supervisor follows raced pathname
+                            Supervisor executes raced pathname as root
                                                      |
                                                      v
-                                      root-only flag returned as data
+                                  unrestricted host UID-0 command stream
 ```
 
 There is no general Docker escape in this chain. Trusted services deliberately
@@ -154,7 +156,8 @@ run reports stages resembling:
 [+] Worker corruption: callback redirected via 0x...
 [+] host shell: uid relay
 [+] direct flag read: denied
-[+] Supervisor TOCTOU: root-only flag disclosed
+[+] Supervisor TOCTOU: unrestricted host shell uid=0
+[+] root flag: disclosed directly from the UID-0 shell
 RF{...}
 ```
 
@@ -338,7 +341,7 @@ OK
 ```
 
 Save the job UUID from the banner. It identifies the active transient systemd
-unit and is required by the final archive request.
+unit and is required by the final diagnostic request.
 
 ## Stage 4: leak the PIE address and overwrite the callback
 
@@ -394,35 +397,48 @@ inside the active Worker systemd cgroup.
 
 ## Stage 5: exploit the Supervisor pathname race
 
-The root Supervisor exposes a narrow `archive` operation over a Unix socket.
-It accepts this operation only when the kernel reports UID `relay` and the
-caller PID belongs to the active Worker cgroup for the supplied job UUID.
+The root Supervisor exposes one `diagnose` operation over a Unix socket. It
+accepts it only when the kernel reports UID `relay`, the caller PID belongs to
+the supplied job's active Worker cgroup, and the filename is exactly
+`diagnostic.sh`.
 
-The archive implementation:
+Create a relay-owned, single-link, mode-`0700` file with these exact bytes:
 
-1. checks that `work/race.log` is a small, single-link regular file owned by
-   `relay`;
-2. waits 100 ms; and
-3. opens that pathname again as root.
-
-The bug is that validation and use do not share an open file descriptor.
-During the delay, the attacker replaces the checked regular file with a
-symlink to:
-
-```text
-/var/lib/relayforge/flag/root.txt
+```sh
+#!/bin/sh
+printf 'RelayForge diagnostic OK\n'
 ```
 
-The supplied `attacks/exploit_supervisor_race.py` helper repeats this race.
-It must execute through the active relay shell so that the Supervisor sees the
-correct UID, PID, and Worker cgroup. The end-to-end `attacks/full_chain.py`
-client transfers and invokes it automatically.
+Supervisor opens that file without following links, validates its metadata and
+content, closes the descriptor, replies
+`{"ok":true,"state":"validated"}`, waits 250 ms, and then executes the
+pathname again as root. That close-and-reopen gap is the bug. After receiving
+the acknowledgement, atomically replace `diagnostic.sh` with an executable
+script that invokes `/bin/sh`. The replacement inherits the same Unix socket
+as stdin, stdout, and stderr.
+
+The supplied `attacks/exploit_supervisor_race.py` helper performs that exact
+acknowledged swap. It must execute through the active relay shell so Supervisor
+sees the correct UID, PID, and Worker cgroup. The end-to-end
+`attacks/full_chain.py` client transfers and invokes it automatically.
 
 Conceptually, the command running in the relay shell is:
 
 ```bash
 python3 /tmp/exploit_supervisor_race.py <JOB-UUID>
 ```
+
+That default mode proves UID 0 and reads the flag, then exits. To keep the
+same socket bridged to an interactive root shell for the short diagnostic
+window, use:
+
+```bash
+python3 /tmp/exploit_supervisor_race.py --interactive <JOB-UUID>
+```
+
+Run `id`, `whoami`, and `pwd` first. The root process is on the Ubuntu host,
+not inside a container. Do not make persistent changes outside the assigned
+disposable exercise.
 
 To transfer it manually, continue in the same local Python prompt. This
 assumes the prompt was started from the extracted release root and that
@@ -451,39 +467,48 @@ command = (
     + "\n"
 )
 s.sendall(command.encode("utf-8"))
-s.settimeout(60)
+s.settimeout(75)
 
 received = bytearray()
 while marker.encode("ascii") not in received:
     chunk = s.recv(4096)
     if not chunk:
-        raise RuntimeError("relay shell closed before returning the flag")
+        raise RuntimeError("relay shell closed before returning the root proof")
     received.extend(chunk)
 print(received.decode(errors="replace"))
 
-flag = re.search(rb"RF\{[0-9a-f]{32}\}", received)
+root_identity = re.search(rb"(?m)^ROOT_UID=0\r?$", received)
+flag = re.search(rb"(?m)^ROOT_FLAG=(RF\{[0-9a-f]{32}\})\r?$", received)
+if root_identity is None:
+    raise RuntimeError("diagnostic race did not produce UID 0")
 if flag is None:
-    raise RuntimeError("race did not win; rerun it before the Worker expires")
-print(flag.group(0).decode("ascii"))
+    raise RuntimeError("root shell did not return the flag")
+print(root_identity.group(0).decode("ascii"))
+print(flag.group(1).decode("ascii"))
 ```
 
 The long base64 value never crosses a public download service. It travels over
 the already compromised Worker shell and is decoded inside that Worker's
 private `/tmp` namespace.
 
-On a winning attempt, Supervisor follows the replacement symlink as root,
-base64-encodes the contents, and returns:
+On a winning attempt, the replacement executes as host root. The helper checks
+`id -u` and reads the flag through that UID-0 command stream, producing output
+like:
 
 ```text
-RF{...}
+ROOT_UID=0
+ROOT_FLAG=RF{...}
 ```
 
-This is a confused-deputy disclosure. The attacker does not become UID 0; the
-root Supervisor performs one unintended read on the attacker's behalf.
+This is genuine unrestricted host-root execution. The child can perform any
+operation allowed to root on that VM. The challenge helper demonstrates only
+`id` and the flag read, but the security impact is much larger.
 
 After recording the flag, close the socket and click **Close tunnel** for the
-malicious request, or let its 420-second lifetime expire. This stops the
-transient Worker; it does not reset the database or rotate the flag.
+malicious request, or let its 420-second lifetime expire. This stops normal
+challenge processes, but unrestricted root could have made persistent changes.
+Only destroying and recreating the disposable VM is a trustworthy reset after
+the final stage.
 
 ## What “jumping from Docker to the host” actually means
 
@@ -497,7 +522,7 @@ Describe each boundary precisely:
 | Signed dispatch | Dispatcher container | Dispatcher writes the signed envelope to a host-mounted Unix socket |
 | Worker launch | Root Supervisor on Ubuntu | Supervisor verifies the signature and intentionally asks systemd to create a host Worker as `relay` |
 | Worker exploit | Native host process, UID `relay` | Player connects directly to the temporary host port and corrupts its callback |
-| Flag disclosure | Root Supervisor | The `relay` shell wins the archive race; Supervisor reads the file as root |
+| Root escalation | Root Supervisor | The `relay` shell wins the diagnostic pathname race; Supervisor executes the replacement as unrestricted host UID 0 |
 
 Therefore:
 
@@ -510,8 +535,10 @@ Therefore:
 - The Worker is a native host systemd service, not a sixth container.
 - There is no `docker.sock` mount and no Docker escape exploit.
 - The first host shell appears only after corrupting that launched Worker.
-- The final transition is from unprivileged host `relay` to root-only data,
-  not from `relay` to a root shell.
+- The final transition is from unprivileged host `relay` to an actual root
+  process on the Ubuntu host. It is intentionally not a Docker escape: the
+  already-hosted root Supervisor crosses that boundary on the attacker's
+  behalf.
 
 ## Common player mistakes
 
@@ -527,7 +554,10 @@ Therefore:
   Worker connection for challenge commands.
 - Assuming Web RCE is host root. It is UID 65532 in a read-only container.
 - Assuming the Worker shell can directly read the flag. Permission denied is
-  expected; the Supervisor race is the required final stage.
+  expected; the Supervisor diagnostic race is the required escalation to UID 0.
+- Treating `reset-lab.sh` as trustworthy cleanup after root compromise. Rebuild
+  the disposable VM, because a root payload could persist outside challenge
+  state.
 - Timing out on every `250xx` port. Ask the organizer to verify the AWS
   Security Group permits TCP `25000-25099` and that the Worker is still alive.
 
@@ -545,4 +575,5 @@ For a discovery exercise, reveal hints gradually:
    line protocol.
 6. Legacy Worker mode exposes a code address and a bounded callback overwrite.
 7. The Worker shell is a host `relay` process in a transient systemd cgroup.
-8. Review how the root Supervisor validates and later reopens `race.log`.
+8. Review how the root Supervisor validates, acknowledges, and later executes
+   `diagnostic.sh` by pathname.

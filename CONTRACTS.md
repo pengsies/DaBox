@@ -197,6 +197,42 @@ Supervisor returns `{"ok":true}` only after the transient unit is confirmed
 inactive or already absent. A failed/ambiguous stop returns to `stop-ready` and
 is retried; its port and state must not be released while the unit may be live.
 
+### Final diagnostic stream (intentional root vulnerability)
+
+Only a process whose kernel UID is `relay` **and** whose PID belongs to the
+exact active transient Worker cgroup may send:
+
+```json
+{"op":"diagnose","job_id":"<canonical UUIDv4>","name":"diagnostic.sh"}
+```
+
+No other operation, field, or filename is accepted. Before acknowledging it,
+Supervisor opens the file without following links and requires an owned,
+single-link, mode-`0700` regular file whose exact bytes are:
+
+```sh
+#!/bin/sh
+printf 'RelayForge diagnostic OK\n'
+```
+
+Validation success changes the connection from framed JSON to a raw stream:
+
+```json
+{"ok":true,"state":"validated"}
+```
+
+Supervisor then deliberately closes the validated descriptor, waits 250 ms,
+and executes the same pathname again as unrestricted host root. The active
+Worker shell can atomically replace it during that window. The executed
+program receives the same Unix connection as stdin, stdout, and stderr, so a
+replacement shell is interactive over that connection. Execution is bounded
+to the lesser of 60 seconds and the Worker's remaining lifetime; unrestricted
+root can nevertheless alter or persist on the host. There is no trailing JSON
+response.
+
+The former `archive` operation is not part of this contract. Retaining it would
+provide a flag-reading shortcut that bypasses the intended root escalation.
+
 ## 5. Supervisor to Worker
 
 Supervisor generates the random token and listening port after verifying the
