@@ -47,6 +47,11 @@ if grep -qx 'SSH_DEFERRED=0' /etc/relayforge/install.state 2>/dev/null; then
 else
   fail "SSH hardening was not deferred"
 fi
+if grep -qx 'UNRESTRICTED_ROOT_ACK=1' /etc/relayforge/install.state 2>/dev/null; then
+  pass "unrestricted-root challenge mode was explicitly acknowledged"
+else
+  fail "unrestricted-root challenge mode was explicitly acknowledged"
+fi
 
 expect_file /etc/relayforge/compose.env root root 600 "Compose secrets are root-only"
 expect_file /etc/relayforge/firewall.env root root 600 "firewall configuration is root-only"
@@ -81,20 +86,25 @@ supervisor_properties=$(systemctl show relay-supervisor.service \
   -p CapabilityBoundingSet 2>/dev/null)
 if [[ $supervisor_properties == *$'User=root'* && \
       $supervisor_properties == *$'Group=relayforge-ipc'* && \
-      $supervisor_properties == *$'NoNewPrivileges=yes'* && \
-      $supervisor_properties == *$'ProtectSystem=strict'* && \
-      $supervisor_properties == *$'PrivateDevices=yes'* && \
-      $supervisor_properties == *$'MemoryDenyWriteExecute=yes'* ]]; then
-  pass "Supervisor systemd sandbox is active"
+      $supervisor_properties == *$'NoNewPrivileges=no'* && \
+      $supervisor_properties == *$'ProtectSystem=no'* && \
+      $supervisor_properties == *$'ProtectHome=no'* && \
+      $supervisor_properties == *$'PrivateDevices=no'* && \
+      $supervisor_properties == *$'RestrictSUIDSGID=no'* && \
+      $supervisor_properties == *$'MemoryDenyWriteExecute=no'* ]]; then
+  pass "Supervisor is intentionally unrestricted for the host-root challenge"
 else
-  fail "Supervisor systemd sandbox is active"
+  fail "Supervisor is intentionally unrestricted for the host-root challenge"
 fi
 supervisor_capabilities=${supervisor_properties,,}
-if [[ $supervisor_capabilities == *cap_chown* && $supervisor_capabilities == *cap_dac_override* && \
-      $supervisor_capabilities != *cap_sys_admin* && $supervisor_capabilities != *cap_sys_ptrace* ]]; then
-  pass "Supervisor capability set is narrow"
+if [[ $supervisor_capabilities == *cap_chown* && \
+      $supervisor_capabilities == *cap_dac_override* && \
+      $supervisor_capabilities == *cap_net_admin* && \
+      $supervisor_capabilities == *cap_sys_admin* && \
+      $supervisor_capabilities == *cap_sys_ptrace* ]]; then
+  pass "Supervisor retains the host-root capability boundary intentionally"
 else
-  fail "Supervisor capability set is narrow"
+  fail "Supervisor retains the host-root capability boundary intentionally"
 fi
 
 socket_metadata=$(stat -c '%U:%G:%a:%F' /run/relayforge/supervisor.sock 2>/dev/null || true)

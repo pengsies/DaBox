@@ -1,5 +1,10 @@
 # RelayForge Windows-to-Ubuntu setup and acceptance guide
 
+> **Unrestricted-root variant:** a successful player obtains real UID 0 on the
+> Ubuntu host. Use a disposable, single-player VM with no IAM role, reusable
+> credentials, sensitive data, or other workloads. Do not install this branch
+> on the shared Group 30 EC2. Read `UNRESTRICTED_ROOT_WARNING.md` first.
+
 This is the authoritative setup guide for the bounded-lifetime Flask release.
 The RelayForge host must be a native **Ubuntu Server 24.04.x LTS AMD64**
 installation. Ubuntu Desktop, WSL2, and Docker Desktop are not acceptance
@@ -12,6 +17,9 @@ initializers, host services, tests, and installer scripts. It intentionally
 does not contain preloaded multi-gigabyte Docker image layers or generated
 secrets. The Ubuntu VM therefore needs Internet access while the installer
 downloads packages and pulls/builds images.
+
+For recovery of the existing Group 30 EC2, including why each permission and
+service change is made, see `EC2_RECOVERY_AND_UPGRADE.md`.
 
 ## 1. Required files
 
@@ -180,16 +188,23 @@ scp $Zip $Checksum <admin-user>@<vm-ip>:~/
 On Ubuntu:
 
 ```bash
-sha256sum -c RelayForge-Responsibilities-Flask-v1.zip.sha256
 sudo apt-get install -y unzip python3
-unzip RelayForge-Responsibilities-Flask-v1.zip
-cd RelayForge-Responsibilities-Flask-v1
-python3 tests/verify-release-bundle.py ../RelayForge-Responsibilities-Flask-v1.zip
+RF_RELEASE_ZIP=$(readlink -f RelayForge-Responsibilities-Flask-v1.zip)
+RF_RELEASE_SHA=$(readlink -f RelayForge-Responsibilities-Flask-v1.zip.sha256)
+sha256sum -c "$RF_RELEASE_SHA"
+RF_RELEASE_STAGE=$(mktemp -d /tmp/relayforge-release.XXXXXX)
+unzip -q "$RF_RELEASE_ZIP" -d "$RF_RELEASE_STAGE"
+cd "$RF_RELEASE_STAGE/RelayForge-Responsibilities-Flask-v1"
+python3 tests/verify-release-bundle.py "$RF_RELEASE_ZIP"
 python3 tests/check_shared_snapshot.py
 python3 tests/check_integrated_stage.py
 ```
 
 All four verifications must pass before installation.
+
+Always create a new extraction directory. Never rebuild or reinstall from an
+older `/tmp/relayforge-release.*` tree: an old tree can silently reinstall an
+obsolete Worker even when the ZIP in the home directory is current.
 
 ## 6. Optional disposable preflight
 
@@ -272,6 +287,7 @@ in the previous section:
 
 ```bash
 sudo ./scripts/install.sh \
+  --acknowledge-unrestricted-root \
   --player-cidr 0.0.0.0/0 \
   --public-interface "$PUBLIC_IFACE" \
   --admin-user "$ADMIN_USER" \
@@ -284,9 +300,52 @@ database passwords, an Ed25519 signing key, a Flask secret and a self-signed
 TLS certificate, pulls/builds the five containers, installs the systemd units,
 applies the firewall/SSH policy, starts the stack, and runs host verification.
 
+The installer also copies the version-controlled
+`config/60-relayforge-sysctl.conf` to
+`/etc/sysctl.d/60-relayforge.conf`. Make lasting sysctl changes in the project
+file as well as on the host, or a later installation will replace them.
+
+RelayForge expects these runtime ownership boundaries:
+
+```text
+/etc/relayforge/job-signing.pub       root:root            0444
+/var/lib/relayforge/workers           root:root            0711
+/var/lib/relayforge/flag/root.txt     root:root            0600
+/run/relayforge/supervisor.sock       root:relayforge-ipc  0660
+```
+
+Supervisor dynamically recreates the socket and repairs the Worker-state
+parent. The main `/etc/ssh/sshd_config` may safely be root-owned mode `0600` or
+`0644`; RelayForge manages its root-owned mode-`0644` policy drop-in at
+`/etc/ssh/sshd_config.d/60-relayforge-hardening.conf` and verifies the effective
+SSH policy.
+
 Do not rerun the installer with a different endpoint against its existing
 database volume. Restore the clean snapshot or explicitly reset/redeploy the
 disposable VM when changing the endpoint.
+
+### Updating an existing installation
+
+Use the same recorded player CIDR, public interface, administrator, and endpoint
+values. Cancel active connections through the portal or wait for their bounded
+lifetime to expire, confirm no Worker is running, and then rerun the installer
+from a newly verified and newly extracted release:
+
+```bash
+sudo systemctl list-units --state=running --type=service 'relay-worker-*'
+sudo ./scripts/install.sh \
+  --acknowledge-unrestricted-root \
+  --player-cidr 0.0.0.0/0 \
+  --public-interface "$PUBLIC_IFACE" \
+  --admin-user "$ADMIN_USER" \
+  --endpoint-host 127.0.0.1 \
+  --endpoint-port 19001
+sudo strings /opt/relayforge/bin/relay-worker | grep -E 'HTTP/1\.1|/relay/'
+```
+
+Both Worker markers must be present. A Worker that was already running when the
+binary was replaced retains its old loaded executable; create a new portal
+request after the update.
 
 To change a public deployment back to one trusted player network without
 reinstalling:
@@ -310,7 +369,7 @@ curl --fail http://127.0.0.1:19001/health
 curl --fail --insecure https://127.0.0.1/healthz
 ```
 
-Acceptance requires zero hardening failures, five healthy containers, all
+Acceptance requires zero deployment-verification failures, five healthy containers, all
 listed host services active, and both health requests succeeding.
 
 For a host-local functional run, use:
@@ -377,16 +436,17 @@ endpoint through both paths, rejects shortcut attacks, and cancels the Worker.
 `full_chain.py` verifies the authenticated Flask foothold, restricted
 database RPC, Access signature, Dispatcher, real Worker tunnel and intended
 Worker/Supervisor challenge chain. It succeeds only after printing an
-`RF{...}` flag.
+`ROOT_UID=0` proof and an `RF{...}` flag read through that root process.
 
 The release is fully accepted only when all of these are true:
 
 1. Release checksum, manifest, stage, and ZIP verifier pass.
 2. Optional disposable suites contain no failures.
-3. Installed hardening reports zero failures and five containers are healthy.
+3. Installed verification reports zero failures and confirms both the hardened
+   Worker boundary and the deliberately unrestricted Supervisor boundary.
 4. A real `relay-worker-<uuid>.service` and port appear during a request.
 5. Windows `negative_paths.py` passes its actual tunnel test.
-6. Windows `full_chain.py` prints the flag.
+6. Windows `full_chain.py` proves UID 0 and prints the flag.
 
 ## 12. Troubleshooting
 
@@ -397,6 +457,12 @@ The release is fully accepted only when all of these are true:
   Security Group. Use an explicit `https://` URL.
 - **Login works but Worker connection times out:** ports `25000-25099` are not
   reaching the VM or the player source is outside `PLAYER_CIDR`.
+- **Browser reports `ERR_INVALID_HTTP_RESPONSE`:** the host may have an old
+  raw-protocol-only Worker even while all five containers are healthy. Check
+  `sudo strings /opt/relayforge/bin/relay-worker | grep -E 'HTTP/1\.1|/relay/'`.
+  If either marker is absent, reinstall from a newly verified, freshly
+  extracted release, cancel or wait out the existing Worker, and create a new
+  request. Do not rebuild from a previously extracted `/tmp` directory.
 - **SSH times out:** this release does not source-filter SSH inside Ubuntu.
   Confirm the EC2/VM is running, its address is current, TCP 22 is permitted by
   the AWS/hypervisor firewall, and `PUBLIC_IFACE` names the ingress interface.
@@ -407,6 +473,41 @@ The release is fully accepted only when all of these are true:
 - **Certificate warning:** expected for the generated self-signed certificate.
 - **A service fails:** collect `sudo systemctl status <unit>` and
   `sudo journalctl -u <unit> -n 200 --no-pager` before resetting the VM.
+
+## 13. Optional housekeeping
+
+No periodic cleanup is required. Supervisor normally reaps expired Worker
+state, Compose starts with `--remove-orphans`, and old images are harmless while
+disk space remains adequate.
+
+Inspect before removing anything:
+
+```bash
+df -h /
+sudo docker system df
+sudo systemctl list-units --all --type=service 'relay-worker-*'
+sudo find /tmp -maxdepth 1 -type d \
+  \( -name 'relayforge-release.*' -o -name 'relayforge-deploy.*' \
+     -o -name 'relayforge-worker-fix.*' \) -print
+```
+
+After confirming that no Worker is active, clearing historical failed-unit
+status is safe and cosmetic:
+
+```bash
+sudo systemctl reset-failed 'relay-worker-*.service'
+```
+
+Old, positively identified `/tmp/relayforge-*` extraction/build directories may
+be removed after the verified ZIP and checksum are retained. Do not manually
+remove `/opt/relayforge`, `/etc/relayforge`, `/var/lib/relayforge`, or any
+RelayForge Docker volume. Do not use `docker system prune -a --volumes`,
+`docker volume prune`, or `docker compose down --volumes` as housekeeping.
+
+`sudo /opt/relayforge/runtime/reset-lab.sh --yes` is a destructive challenge
+reset, not cleanup: it removes the PostgreSQL volume and Worker state and
+rotates the flag. It is not trustworthy remediation after a player has reached
+unrestricted root; destroy and recreate that VM from a known-good image.
 
 ## Official platform references
 

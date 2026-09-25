@@ -8,6 +8,9 @@ if [[ ${EUID} -ne 0 || ${1:-} != --yes || $# -ne 1 ]]; then
   exit 64
 fi
 
+echo "WARNING: this resets challenge state only; it cannot remediate a host after unrestricted root compromise." >&2
+echo "Destroy and recreate the VM after a participant completes the final stage." >&2
+
 project=/opt/relayforge/app
 environment=/etc/relayforge/compose.env
 systemctl stop relayforge-stack.service 2>/dev/null || true
@@ -27,4 +30,4 @@ systemctl restart relay-backend.service relay-supervisor.service
 systemctl restart relayforge-firewall.service
 systemctl start relayforge-stack.service
 /opt/relayforge/runtime/verify-hardening.sh
-echo "RelayForge state reset; the root flag was rotated."
+echo "RelayForge state reset and flag rotated (not a trusted post-root cleanup)."

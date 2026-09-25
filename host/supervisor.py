@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """Root broker for signed RelayForge jobs.
 
-The archive pathname reopen in ``archive_file`` is the final intentional flaw.
-Everything before that point is deliberately strict so it cannot be used as a
-generic root command runner.
+The pathname re-execution in ``run_diagnostic`` is the final intentional flaw.
+Everything before that point is deliberately strict so only a shell already
+running inside the active Worker can reach the vulnerable operation.
 """
 
 from __future__ import annotations
 
-import base64
 import ipaddress
 import json
 import logging
@@ -45,10 +44,12 @@ PORT_FIRST = 25_000
 PORT_LAST = 25_099
 BACKLOG = 32
 MAX_RPC_BYTES = 16_384
-MAX_ARCHIVE_BYTES = 4096
-ARCHIVE_DELAY_SECONDS = 0.100
+DIAGNOSTIC_SCRIPT = b"#!/bin/sh\nprintf 'RelayForge diagnostic OK\\n'\n"
+DIAGNOSTIC_NAME = "diagnostic.sh"
+DIAGNOSTIC_MODE = 0o700
+DIAGNOSTIC_DELAY_SECONDS = 0.250
+DIAGNOSTIC_MAX_SECONDS = 60.0
 TOKEN_RE = re.compile(r"[0-9a-f]{48}\Z", re.ASCII)
-NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z", re.ASCII)
 NOTE_RE = re.compile(r"[a-z0-9._-]{1,32}\Z", re.ASCII)
 TARGET_RE = re.compile(r"[a-z][a-z0-9-]{2,31}\Z", re.ASCII)
 UTC_SECONDS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00\Z", re.ASCII)
@@ -567,15 +568,25 @@ class Supervisor:
                 return True
         return False
 
-    def archive_file(
-        self, message: dict[str, Any], peer_pid: int
-    ) -> dict[str, object]:
-        if set(message) != {"op", "job_id", "name"} or message.get("op") != "archive":
-            raise ProtocolError("invalid archive schema")
+    def run_diagnostic(
+        self,
+        message: dict[str, Any],
+        peer_pid: int,
+        connection: socket.socket,
+    ) -> None:
+        """Validate a fixed diagnostic, then intentionally re-execute its path.
+
+        Once validation succeeds this method owns the connection.  It emits one
+        JSON acknowledgement and then lends the same socket to the root child as
+        standard input, output, and error.  There is deliberately no second JSON
+        response because the byte stream has become the interactive child stream.
+        """
+        if set(message) != {"op", "job_id", "name"} or message.get("op") != "diagnose":
+            raise ProtocolError("invalid diagnose schema")
         job_id = _canonical_uuid(message.get("job_id"))
         name = message.get("name")
-        if type(name) is not str or NAME_RE.fullmatch(name) is None:
-            raise ProtocolError("invalid archive name")
+        if name != DIAGNOSTIC_NAME:
+            raise ProtocolError("invalid diagnostic name")
         with self.lock:
             active = self.active.get(job_id)
         if (
@@ -584,33 +595,99 @@ class Supervisor:
             or not self._unit_active(active.unit)
             or not self._peer_in_job(peer_pid, active.unit)
         ):
-            raise PermissionError("archive caller is not the active Worker")
+            raise PermissionError("diagnostic caller is not the active Worker")
         path = active.run_dir / "work" / name
-        checked = path.lstat()
-        if (
-            not stat.S_ISREG(checked.st_mode)
-            or checked.st_uid != self.relay_uid
-            or checked.st_nlink != 1
-            or checked.st_size > MAX_ARCHIVE_BYTES
-        ):
-            raise ProtocolError("archive source failed validation")
-
-        # INTENTIONAL-VULNERABILITY RF-SUP-01: validation and use do not share
-        # an fd. The relay user can replace this checked pathname during the
-        # deterministic delay, causing the privileged reopen to follow a link.
-        time.sleep(ARCHIVE_DELAY_SECONDS)
-        flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NONBLOCK", 0)
+        flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(path, flags)
         try:
-            used = os.fstat(descriptor)
-            if not stat.S_ISREG(used.st_mode) or used.st_size > MAX_ARCHIVE_BYTES:
-                raise ProtocolError("archive target is not a bounded regular file")
-            data = os.read(descriptor, MAX_ARCHIVE_BYTES + 1)
+            checked = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(checked.st_mode)
+                or checked.st_uid != self.relay_uid
+                or checked.st_nlink != 1
+                or stat.S_IMODE(checked.st_mode) != DIAGNOSTIC_MODE
+                or checked.st_size != len(DIAGNOSTIC_SCRIPT)
+            ):
+                raise ProtocolError("diagnostic script metadata failed validation")
+            data = os.read(descriptor, len(DIAGNOSTIC_SCRIPT) + 1)
         finally:
             os.close(descriptor)
-        if len(data) > MAX_ARCHIVE_BYTES:
-            raise ProtocolError("archive target exceeded limit")
-        return {"ok": True, "data_b64": base64.b64encode(data).decode("ascii")}
+        if data != DIAGNOSTIC_SCRIPT:
+            raise ProtocolError("diagnostic script content failed validation")
+
+        connection.sendall(canonical_response({"ok": True, "state": "validated"}))
+
+        # INTENTIONAL-VULNERABILITY RF-SUP-ROOT-01: the validated descriptor is
+        # closed above.  After this deterministic race window, root executes the
+        # pathname again.  The active relay Worker can atomically replace the
+        # harmless script with an attacker-controlled executable and thereby
+        # obtain an unrestricted host-root command stream on this same socket.
+        process: subprocess.Popen[bytes] | None = None
+        try:
+            time.sleep(DIAGNOSTIC_DELAY_SECONDS)
+            remaining = active.deadline - time.time()
+            if remaining <= 0:
+                connection.sendall(b"RelayForge diagnostic expired\n")
+                return
+
+            # _read_request() placed a three-second timeout on this socket.
+            # Restore blocking I/O before it becomes the child's terminal-like
+            # byte stream so an idle interactive shell does not receive EAGAIN.
+            connection.settimeout(None)
+            LOG.warning(
+                "executing intentionally unrestricted root diagnostic job=%s name=%s",
+                job_id,
+                name,
+            )
+            process = subprocess.Popen(
+                [os.fspath(path)],
+                stdin=connection,
+                stdout=connection,
+                stderr=connection,
+                cwd=os.fspath(active.run_dir / "work"),
+                env={
+                    "HOME": "/root",
+                    "LANG": "C.UTF-8",
+                    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                    "SHELL": "/bin/sh",
+                    "USER": "root",
+                },
+                close_fds=True,
+                start_new_session=True,
+            )
+            process.wait(timeout=min(DIAGNOSTIC_MAX_SECONDS, remaining))
+        except subprocess.TimeoutExpired:
+            if process is not None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    # An unrestricted root payload may deliberately leave or
+                    # replace its original process group.  The direct child is
+                    # still killed where possible; persistence is intentionally
+                    # in scope for this disposable-host challenge variant.
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        LOG.warning(
+                            "unrestricted diagnostic child escaped termination job=%s",
+                            job_id,
+                        )
+        except Exception:
+            # After the acknowledgement, never fall back to the JSON RPC
+            # responder: the client now interprets this as a raw command stream.
+            LOG.exception("validated diagnostic pathname could not be executed")
+            try:
+                connection.sendall(b"RelayForge diagnostic execution failed\n")
+            except OSError:
+                pass
 
     def _remove_state(self, active: ActiveJob) -> None:
         try:
@@ -706,8 +783,10 @@ def handle_connection(supervisor: Supervisor, connection: socket.socket) -> None
             reply = supervisor.launch(message)
         elif operation == "stop" and peer_uid == supervisor.dispatch_uid:
             reply = supervisor.stop(message)
-        elif operation == "archive" and peer_uid == supervisor.relay_uid:
-            reply = supervisor.archive_file(message, peer_pid)
+        elif operation == "diagnose" and peer_uid == supervisor.relay_uid:
+            supervisor.run_diagnostic(message, peer_pid, connection)
+            connection.close()
+            return
         else:
             raise PermissionError("operation is not allowed for peer")
     except Exception as exc:

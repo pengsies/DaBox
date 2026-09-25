@@ -10,10 +10,14 @@ from pathlib import Path
 SHARED = Path(__file__).resolve().parents[1]
 REQUIRED = (
     ".env.example",
+    "ATTACK_REPORT.md",
+    "PLAYER_ATTACK_GUIDE.md",
     "README.md",
     "CONTRACTS.md",
     "DOCKER_COMPONENTS.md",
+    "EC2_RECOVERY_AND_UPGRADE.md",
     "SETUP.md",
+    "UNRESTRICTED_ROOT_WARNING.md",
     "WEB_REQUIRED.md",
     "compose.yaml",
     "config/nginx.conf",
@@ -95,10 +99,13 @@ def main() -> int:
 
     schema = (SHARED / "db/init/002-schema.sql.in").read_text(encoding="utf-8")
     supervisor = (SHARED / "host/supervisor.py").read_text(encoding="utf-8")
+    installer = (SHARED / "scripts/install.sh").read_text(encoding="utf-8")
     if "max_duration BETWEEN 30 AND 420" not in schema or "duration BETWEEN 30 AND 420" not in schema:
         failures.append("bounded 30-420 second database contract changed")
     if "Restart=always" in supervisor or "WORKER_ROTATION_SECONDS" in supervisor:
         failures.append("parent-lab Worker rotation leaked into bounded responsibilities")
+    if "--acknowledge-unrestricted-root" not in installer:
+        failures.append("unrestricted-root installer acknowledgement is missing")
     for expected in ("cancel_request", "claim_stop", "finish_stop"):
         if expected not in schema:
             failures.append(f"cancellation DB contract missing: {expected}")

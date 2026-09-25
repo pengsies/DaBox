@@ -165,14 +165,32 @@ def main() -> int:
         if config_metadata != "root:relayforge-ipc:440":
             raise RuntimeError(f"Worker config metadata is unsafe: {config_metadata}")
 
+        diagnostic_path = f"/var/lib/relayforge/workers/{job_id}/work/diagnostic.sh"
+        diagnostic_bytes = b"#!/bin/sh\nprintf 'RelayForge diagnostic OK\\n'\n"
+        diagnostic_encoded = base64.b64encode(diagnostic_bytes).decode("ascii")
+        diagnostic_request = json.dumps(
+            {"op": "diagnose", "job_id": job_id, "name": "diagnostic.sh"},
+            separators=(",", ":"),
+        )
         probe_command = (
-            f"printf x > /var/lib/relayforge/workers/{job_id}/work/probe.log; "
-            f"python3 /test/launch_client.py '{json.dumps({'op': 'archive', 'job_id': job_id, 'name': 'probe.log'}, separators=(',', ':'))}'"
+            f"printf %s {shlex.quote(diagnostic_encoded)} | base64 -d > {shlex.quote(diagnostic_path)}; "
+            f"chmod 0700 {shlex.quote(diagnostic_path)}; "
+            f"python3 /test/launch_client.py {shlex.quote(diagnostic_request)}"
         )
         outside = exec_in(name, "/bin/sh", "-c", probe_command, user="relay").stdout
         outside_reply = json.loads(outside.splitlines()[-1])
         if outside_reply.get("ok") is not False:
-            raise RuntimeError("relay process outside the Worker cgroup could archive")
+            raise RuntimeError("relay process outside the Worker cgroup could run a diagnostic")
+        wrong_uid = exec_in(
+            name,
+            "python3",
+            "/test/launch_client.py",
+            diagnostic_request,
+            user="relay-dispatch",
+        ).stdout
+        wrong_uid_reply = json.loads(wrong_uid.splitlines()[-1])
+        if wrong_uid_reply.get("ok") is not False:
+            raise RuntimeError("non-relay kernel UID could invoke the diagnostic RPC")
 
         mapping = docker("port", name, "25000/tcp").stdout.strip()
         host_port = int(mapping.rsplit(":", 1)[1])
@@ -248,7 +266,7 @@ def main() -> int:
             raise RuntimeError("could not transfer race helper into real Worker")
         race_output, race_rc = chain._shell_capture(client, f"python3 {remote} {job_id}", 20)
         flag = chain.FLAG_RE.search(race_output)
-        if race_rc != 0 or flag is None:
+        if race_rc != 0 or "ROOT_UID=0" not in race_output or flag is None:
             raise RuntimeError(f"real Supervisor race failed: rc={race_rc}, output={race_output}")
         if flag.group(0) != "RF{fedcba98765432100123456789abcdef}":
             raise RuntimeError("Supervisor race returned unexpected data")
@@ -263,7 +281,10 @@ def main() -> int:
         if client is not None:
             client.close()
         docker("rm", "--force", name, check=False)
-    print("PASS: real signed Supervisor→systemd Worker→relay shell→cgroup gate→TOCTOU flag chain")
+    print(
+        "PASS: real Worker relay shell cannot read the flag; unauthorized peers fail; "
+        "diagnostic TOCTOU executes as UID 0 and reads the root flag"
+    )
     return 0
 
 

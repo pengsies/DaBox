@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check the bounded Supervisor/Worker handoff variant."""
+"""Check the bounded Worker plus unrestricted-root diagnostic variant."""
 
 from __future__ import annotations
 
@@ -18,13 +18,24 @@ def main() -> int:
         'set(message) != {"op", "job_id"}',
         'operation == "stop" and peer_uid == supervisor.dispatch_uid',
         "if not self._stop_unit(unit)",
-        "time.sleep(ARCHIVE_DELAY_SECONDS)",
+        'DIAGNOSTIC_NAME = "diagnostic.sh"',
+        'set(message) != {"op", "job_id", "name"}',
+        'operation == "diagnose" and peer_uid == supervisor.relay_uid',
+        "_peer_in_job(peer_pid, active.unit)",
+        'connection.sendall(canonical_response({"ok": True, "state": "validated"}))',
+        "time.sleep(DIAGNOSTIC_DELAY_SECONDS)",
+        "process = subprocess.Popen(",
+        "stdin=connection",
+        "stdout=connection",
+        "stderr=connection",
     )
     for marker in required_supervisor:
         if marker not in supervisor:
             failures.append(f"Supervisor contract missing: {marker}")
     if "Restart=always" in supervisor or "WORKER_ROTATION_SECONDS" in supervisor:
         failures.append("rotating parent lifecycle leaked into bounded Supervisor")
+    if "archive_file" in supervisor or "ARCHIVE_DELAY_SECONDS" in supervisor:
+        failures.append("retired archive-read primitive leaked into root-diagnostic variant")
     for marker in (
         "TOKEN ",
         "CONNECTED\\n",
@@ -40,7 +51,7 @@ def main() -> int:
         for failure in failures:
             print(f"FAIL: {failure}")
         return 1
-    print("PASS: bounded Supervisor launch/stop/archive and Worker handoff contracts")
+    print("PASS: bounded Worker lifecycle and unrestricted-root diagnostic contracts")
     return 0
 
 

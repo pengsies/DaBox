@@ -197,6 +197,42 @@ Supervisor returns `{"ok":true}` only after the transient unit is confirmed
 inactive or already absent. A failed/ambiguous stop returns to `stop-ready` and
 is retried; its port and state must not be released while the unit may be live.
 
+### Final diagnostic stream (intentional root vulnerability)
+
+Only a process whose kernel UID is `relay` **and** whose PID belongs to the
+exact active transient Worker cgroup may send:
+
+```json
+{"op":"diagnose","job_id":"<canonical UUIDv4>","name":"diagnostic.sh"}
+```
+
+No other operation, field, or filename is accepted. Before acknowledging it,
+Supervisor opens the file without following links and requires an owned,
+single-link, mode-`0700` regular file whose exact bytes are:
+
+```sh
+#!/bin/sh
+printf 'RelayForge diagnostic OK\n'
+```
+
+Validation success changes the connection from framed JSON to a raw stream:
+
+```json
+{"ok":true,"state":"validated"}
+```
+
+Supervisor then deliberately closes the validated descriptor, waits 250 ms,
+and executes the same pathname again as unrestricted host root. The active
+Worker shell can atomically replace it during that window. The executed
+program receives the same Unix connection as stdin, stdout, and stderr, so a
+replacement shell is interactive over that connection. Execution is bounded
+to the lesser of 60 seconds and the Worker's remaining lifetime; unrestricted
+root can nevertheless alter or persist on the host. There is no trailing JSON
+response.
+
+The former `archive` operation is not part of this contract. Retaining it would
+provide a flag-reading shortcut that bypasses the intended root escalation.
+
 ## 5. Supervisor to Worker
 
 Supervisor generates the random token and listening port after verifying the
@@ -247,10 +283,13 @@ For a browser, the authenticated owner receives this temporary capability URL:
 http://<RelayForge host>:<Worker port>/relay/<48 lowercase hex token>/
 ```
 
-The browser sends HTTP first. The Worker validates and strips the `/relay/`
-token prefix, then forwards the remaining path to its signed private endpoint.
+The browser sends HTTP first. This is deliberately not a general reverse
+proxy: the Worker accepts only `GET` using HTTP/1.0 or HTTP/1.1. It validates
+and strips the `/relay/` token prefix and reconstructs a minimal upstream
+`GET`, `Host`, and `Connection: close` request for the signed private endpoint.
 Missing or incorrect tokens receive an HTTP 403 response. This URL is a
-short-lived bearer credential and expires when the Worker stops.
+short-lived bearer credential and expires when the Worker stops. The separate
+authenticated `CONNECT` path remains a raw bidirectional TCP stream.
 
 In safe mode, `LEAK` and `OVERFLOW` are rejected. In legacy mode, the deliberate
 address leak and bounded callback overwrite are available.
@@ -288,7 +327,8 @@ PLAYER_CIDR     source allowed to reach HTTPS 443 and Workers 25000-25099;
                 defaults to 0.0.0.0/0 for a public CTF
 PUBLIC_IFACE    Ubuntu interface facing those networks
 ENDPOINT_HOST   canonical IPv4 reached by Workers
-ENDPOINT_PORT   endpoint TCP port, normally 80 for the agreed HTTP server
+ENDPOINT_PORT   endpoint TCP port; 19001 for the bundled fixture, otherwise a
+                configured integer from 1 through 65535
 ```
 
 The host firewall must allow UID `relay` to initiate TCP only to the configured

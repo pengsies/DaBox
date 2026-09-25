@@ -29,6 +29,7 @@ stage=$build_root/$release_name
 install -d -m 0755 "$stage"
 
 rsync -a \
+  --exclude='.git/' \
   --exclude='.DS_Store' \
   --exclude='.env' \
   --exclude='*.key' \

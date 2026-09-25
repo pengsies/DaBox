@@ -14,10 +14,14 @@ from pathlib import PurePosixPath
 
 REQUIRED = {
     ".env.example",
+    "ATTACK_REPORT.md",
+    "PLAYER_ATTACK_GUIDE.md",
     "README.md",
     "CONTRACTS.md",
     "DOCKER_COMPONENTS.md",
+    "EC2_RECOVERY_AND_UPGRADE.md",
     "SETUP.md",
+    "UNRESTRICTED_ROOT_WARNING.md",
     "WEB_REQUIRED.md",
     "compose.yaml",
     "config/nginx.conf",
@@ -60,6 +64,8 @@ def main() -> int:
             path = PurePosixPath(name)
             if path.is_absolute() or ".." in path.parts or not path.parts:
                 raise SystemExit(f"unsafe ZIP path: {name}")
+            if ".git" in path.parts:
+                raise SystemExit(f"repository metadata in ZIP: {name}")
             root = root or path.parts[0]
             if path.parts[0] != root:
                 raise SystemExit("ZIP has more than one release root")

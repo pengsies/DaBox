@@ -25,6 +25,23 @@ docker run --rm --platform linux/amd64 \
       /etc/systemd/system/relay-supervisor.service \
       /etc/systemd/system/relayforge-firewall.service \
       /etc/systemd/system/relayforge-stack.service
+    supervisor=/etc/systemd/system/relay-supervisor.service
+    for declaration in \
+      NoNewPrivileges=no \
+      PrivateDevices=no \
+      PrivateIPC=no \
+      PrivateTmp=no \
+      ProtectHome=no \
+      ProtectSystem=no \
+      RestrictNamespaces=no \
+      RestrictSUIDSGID=no \
+      MemoryDenyWriteExecute=no \
+      LockPersonality=no
+    do
+      grep -Fqx "$declaration" "$supervisor"
+    done
+    grep -Fq "INTENTIONAL-VULNERABILITY RF-SUP-ROOT-01" "$supervisor"
+    ! grep -Eq "^[[:space:]]*(CapabilityBoundingSet|AmbientCapabilities)=" "$supervisor"
     systemd-analyze --version | grep -Eq "^systemd (25[5-9]|2[6-9][0-9]|[3-9][0-9]{2})"
   '
-echo "PASS: all systemd units validate with Ubuntu 24.04 systemd 255+"
+echo "PASS: systemd units validate and Supervisor explicitly runs unrestricted root"

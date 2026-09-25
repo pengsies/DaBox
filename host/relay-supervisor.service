@@ -14,34 +14,21 @@ RestartSec=2s
 RuntimeDirectory=relayforge
 RuntimeDirectoryMode=0750
 UMask=0027
-NoNewPrivileges=yes
-PrivateDevices=yes
-PrivateIPC=yes
-PrivateTmp=yes
-ProtectClock=yes
-ProtectControlGroups=yes
-ProtectHome=yes
-ProtectHostname=yes
-ProtectKernelLogs=yes
-ProtectKernelModules=yes
-ProtectKernelTunables=yes
-ProtectSystem=strict
-ReadOnlyPaths=/opt/relayforge /etc/relayforge
-ReadWritePaths=/run/relayforge /var/lib/relayforge/workers
-CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
-AmbientCapabilities=
-LockPersonality=yes
-MemoryDenyWriteExecute=yes
-ProtectProc=default
-RemoveIPC=yes
-RestrictAddressFamilies=AF_UNIX AF_INET
-RestrictNamespaces=yes
-RestrictRealtime=yes
-RestrictSUIDSGID=yes
-SystemCallArchitectures=native
-TasksMax=64
-LimitNOFILE=256
-LimitCORE=0
+# INTENTIONAL-VULNERABILITY RF-SUP-ROOT-01: this challenge variant is designed
+# to turn the diagnostic pathname race into unrestricted host-root execution.
+# The root child therefore shares the host filesystem, network, devices,
+# namespaces, IPC, capability bounding set, and privilege domain.  Deploy only
+# on a disposable, single-player machine with no IAM role or sensitive data.
+NoNewPrivileges=no
+PrivateDevices=no
+PrivateIPC=no
+PrivateTmp=no
+ProtectHome=no
+ProtectSystem=no
+RestrictNamespaces=no
+RestrictSUIDSGID=no
+MemoryDenyWriteExecute=no
+LockPersonality=no
 TimeoutStopSec=10s
 
 [Install]

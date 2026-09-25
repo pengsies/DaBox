@@ -8,7 +8,8 @@ to the integrated RelayForge path:
 - kernel-verified Unix-socket peer credentials;
 - Ed25519 verification of Access-created jobs;
 - transient, unprivileged systemd Workers; and
-- the intentionally vulnerable archive pathname reopen used by the final race.
+- the intentionally vulnerable diagnostic pathname re-execution used by the
+  final host-root race.
 
 Those ideas are retained in the deployable Supervisor mirrored in this folder.
 The standalone C Supervisor, replacement Worker, rotation timers, and manual
@@ -16,18 +17,19 @@ commands from the prototype notes are not deployment inputs. They used wire
 formats, state files, identities, and security boundaries that differ from the
 agreed cross-team contract.
 
-This shared version is authoritative for the bounded Flask variant. The parent
-lab has intentionally diverged to rotating Worker generations.
+This shared version is authoritative for the bounded-lifetime,
+unrestricted-root Flask variant. The parent lab has intentionally diverged to
+rotating Worker generations.
 
 ## Integrated files
 
 | Shared mirror | Purpose |
 |---|---|
-| `host/supervisor.py` | Signed-job broker, transient-Worker lifecycle, active-cgroup archive gate, and intentional bounded TOCTOU. |
-| `host/relay-supervisor.service` | Root broker sandbox, runtime socket directory, narrow capabilities, and resource limits. |
-| `tests/test_supervisor.py` | Component coverage for canonical jobs, signatures, exact Worker configuration, archive gates, and the race primitive. |
+| `host/supervisor.py` | Signed-job broker, transient-Worker lifecycle, active-cgroup diagnostic gate, and intentional root-exec TOCTOU. |
+| `host/relay-supervisor.service` | Deliberately unrestricted root broker and runtime socket directory for this dangerous challenge variant. |
+| `tests/test_supervisor.py` | Component coverage for canonical jobs, signatures, exact Worker configuration, diagnostic gates, and the race primitive. |
 | `tests/test_systemd_units.sh` | Ubuntu systemd validation for the integrated units. |
-| `tests/supervisor_systemd_integration.py` | Real signed Supervisor to transient Worker, tunnel, Worker exploit, cgroup gate, and archive-race test. |
+| `tests/supervisor_systemd_integration.py` | Real signed Supervisor to transient Worker, tunnel, Worker exploit, cgroup gate, and root diagnostic-race test. |
 
 ## Non-negotiable integration boundary
 
@@ -48,9 +50,12 @@ lab has intentionally diverged to rotating Worker generations.
   arguments are the player-facing port and configuration path.
 - Readiness is `<job>/work/ready`, owned by `relay`, mode `0600`, with exact
   contents `ready\n`.
-- Archive accepts only the `relay` UID from the exact active Worker cgroup for
-  that job. It returns at most 4096 bytes as `data_b64`. The documented
-  validation-to-reopen race is the only intentional Supervisor flaw.
+- Diagnose accepts only the `relay` UID from the exact active Worker cgroup for
+  that job and the exact filename `diagnostic.sh`. It validates one fixed mode
+  `0700` benign script, acknowledges validation, waits 250 ms, and executes the
+  pathname again as unrestricted host root with the socket as standard I/O.
+- The Supervisor is intentionally not systemd-sandboxed in this variant. This
+  is the selected final-stage behavior, not a production recommendation.
 
 See `../CONTRACTS.md` for the complete shared contract.
 
@@ -72,7 +77,7 @@ Access/Dispatcher database path. `supervisor_systemd_integration.py` is the
 disposable-container proof for the real Supervisor and Worker on a native
 AMD64 Docker engine; it skips ARM-host emulation. Only a clean Ubuntu VM
 installation followed by `tests/run-vm.sh` proves the complete
-Access-to-root-flag path with the real firewall and network.
+Access-to-unrestricted-root path with the real firewall and network.
 
 ## Final deployment inputs
 
@@ -81,3 +86,7 @@ endpoint IPv4/port. `PLAYER_CIDR` defaults to public IPv4 (`0.0.0.0/0`), and
 key-only SSH is not source-filtered by the guest firewall. Keep the logical
 service name `echo` unless every DB, Web, Access, Supervisor, and test owner
 coordinates the rename.
+
+Read `../UNRESTRICTED_ROOT_WARNING.md` before deployment. Never install this
+variant in place on the shared bounded-disclosure EC2; use a disposable,
+single-player machine with no cloud role or valuable data.
