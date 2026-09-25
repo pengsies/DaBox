@@ -203,6 +203,11 @@ def create_app() -> Flask:
             return render_template("dashboard.html", targets=[], backend_error=True), 503
         return render_template("dashboard.html", targets=targets, backend_error=False)
 
+    @app.get("/cookie-policy")
+    @login_required
+    def cookie_policy():
+        return render_template("cookie_policy.html")
+
     @app.post("/connections")
     @login_required
     def request_connection():

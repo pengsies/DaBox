@@ -10,7 +10,7 @@ consistent.
 nginx is the only public container listener and publishes HTTPS 443. Flask is
 reachable only on the internal Compose network as `web:8080`.
 
-Authenticated routes are `/dashboard`, `/connections[/<uuid>]`,
+Authenticated routes are `/dashboard`, `/cookie-policy`, `/connections[/<uuid>]`,
 `/connections/cancel`, `/api/request`, `/api/status[/<uuid>]`, `/api/cancel`,
 and `/api/result[/<name>]`. Mutations require the signed session and CSRF
 token. Web calls only these DB functions:
