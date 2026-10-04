@@ -1,0 +1,17 @@
+RELAYFORGE_STAGE=1_WEB_CONTAINER
+
+ACCESS
+You have command execution as UID 65532 inside the read-only relayforge-web
+container. This is not the Ubuntu host, Docker control, or UID 0.
+
+BOUNDARY
+This process can reach PostgreSQL only as relay_web. That role cannot read the
+private job tables, sign jobs, or contact the host Supervisor directly.
+
+NEXT
+Use the Web process's database credentials and the intended raw-request parser
+differential to make Access approve and sign a transient Worker job. Then use
+the issued port and token to reach that Worker.
+
+NOTE
+This committed file is a learning breadcrumb, not the secret scoring flag.

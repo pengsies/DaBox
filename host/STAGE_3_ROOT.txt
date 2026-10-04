@@ -1,0 +1,14 @@
+RELAYFORGE_STAGE=3_UNRESTRICTED_HOST_ROOT
+
+ACCESS
+You have reached UID 0 in the Ubuntu host privilege domain through the intended
+Supervisor diagnostic race. This is unrestricted host root, not container
+root.
+
+NEXT
+Read /var/lib/relayforge/flag/root.txt to complete the challenge. The organizer
+must destroy and recreate the disposable VM after this stage; an in-place reset
+cannot be trusted after unrestricted root compromise.
+
+NOTE
+This committed file is a learning breadcrumb, not the secret scoring flag.

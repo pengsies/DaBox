@@ -22,10 +22,15 @@ RUN make -C /build clean all \
  && rm -rf /build
 
 COPY host/supervisor.py host/backend.py /opt/relayforge/runtime/
+COPY host/STAGE_2_WORKER.txt host/STAGE_3_ROOT.txt /tmp/relayforge-stages/
 COPY host/relay-supervisor.service host/relay-backend.service /etc/systemd/system/
 COPY tests/systemd/sign_job.py tests/systemd/launch_client.py /test/
 
-RUN chmod 0555 /opt/relayforge/runtime/*.py /test/*.py \
+RUN install -d -o root -g root -m 0711 /var/lib/relayforge/stages \
+ && install -o root -g relayforge-ipc -m 0440 /tmp/relayforge-stages/STAGE_2_WORKER.txt /var/lib/relayforge/stages/STAGE_2_WORKER.txt \
+ && install -o root -g root -m 0400 /tmp/relayforge-stages/STAGE_3_ROOT.txt /var/lib/relayforge/stages/STAGE_3_ROOT.txt \
+ && rm -rf /tmp/relayforge-stages \
+ && chmod 0555 /opt/relayforge/runtime/*.py /test/*.py \
  && openssl genpkey -algorithm ED25519 -out /test/job-signing.pem \
  && openssl pkey -in /test/job-signing.pem -pubout -out /etc/relayforge/job-signing.pub \
  && chmod 0400 /test/job-signing.pem \

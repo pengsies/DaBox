@@ -1,0 +1,18 @@
+RELAYFORGE_STAGE=2_HOST_RELAY_WORKER
+
+ACCESS
+You have command execution as the unprivileged relay account inside an active
+transient systemd Worker on the Ubuntu host. This is host access, but it is not
+UID 0.
+
+BOUNDARY
+The Worker has no Linux capabilities, no Docker socket, no signing key, and no
+direct access to the root flag or the root-only stage marker.
+
+NEXT
+From this active Worker's cgroup, submit the exact diagnostic.sh request to the
+Supervisor socket. Win the intended validation/use pathname race to make the
+root Supervisor execute your replacement.
+
+NOTE
+This committed file is a learning breadcrumb, not the secret scoring flag.

@@ -14,6 +14,7 @@ COPY --chown=0:0 app/ ./app/
 COPY --chown=0:0 templates/ ./templates/
 COPY --chown=0:0 static/ ./static/
 COPY --chown=0:0 prefs.py ./prefs.py
+COPY --chown=0:0 STAGE_1_WEB.txt ./STAGE_1_WEB.txt
 
 RUN find /opt/relayforge/web -type d -exec chmod 0555 {} + \
     && find /opt/relayforge/web -type f -exec chmod 0444 {} +
@@ -22,4 +23,3 @@ USER 65532:65532
 EXPOSE 8080
 
 CMD ["gunicorn", "--bind=0.0.0.0:8080", "--workers=2", "--threads=2", "--timeout=15", "--graceful-timeout=10", "--keep-alive=2", "--worker-tmp-dir=/tmp", "--access-logfile=-", "--error-logfile=-", "app:create_app()"]
-

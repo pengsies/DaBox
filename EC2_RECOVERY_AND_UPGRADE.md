@@ -1,560 +1,366 @@
-# RelayForge EC2 recovery and in-place upgrade guide
+# RelayForge EC2 deployment, reconciliation, and recovery
 
-> **STOP for this branch:** the instructions below document recovery of the
-> older bounded flag-disclosure deployment. This unrestricted-root branch must
-> **not** be installed in place on the shared Group 30 EC2. A solver can take
-> full control of the host. Provision a new disposable, single-player instance
-> with no IAM role or valuable data and follow `SETUP.md` instead. Preserve this
-> runbook only as history for maintaining or rolling back the bounded build.
+> **Unrestricted-host-root challenge:** a successful player obtains real UID 0
+> on the EC2 host. Use only a disposable, single-player instance with no IAM
+> role, reusable credentials, valuable data, or other workloads. An in-place
+> reinstall is convenient for testing but is not trusted recovery after anyone
+> reaches the final stage; terminate and recreate the instance instead.
 
-This historical runbook brings the existing Group 30 bounded deployment back
-to a known-good state without deleting its PostgreSQL volume, generated
-secrets, or root flag. It does not authorize applying the current
-unrestricted-root branch to that shared instance.
+This runbook updates the assigned RelayForge EC2 from the authoritative DaBox
+repository and supersedes the historical prototype-layout procedure.
+The example host is `student30@18.216.228.46`; substitute the current address
+if AWS changes it.
 
-Commands are divided between the administrator's computer and the EC2 SSH
-session. Run each command only on the machine named by its section.
+## What “clean” means
 
-## Current EC2 assessment
+The installer owns a deliberately narrow footprint:
 
-The read-only audit on 24 September 2026 found:
+| Location | Reconciled content |
+|---|---|
+| `/opt/relayforge/app` | Compose plus the nginx, Control, database-init, and Web build inputs |
+| `/opt/relayforge/runtime` | Four Python host programs and five supported lifecycle scripts |
+| `/opt/relayforge/bin` | `relay-worker` only |
+| `/etc/systemd/system` | Four current RelayForge units and no Supervisor override drop-in |
 
-| Observation | Meaning | Required action |
-|---|---|---|
-| All five Compose containers were healthy | nginx, Flask, PostgreSQL, Access, and Dispatcher remained operational | Preserve the Docker volume; do not reset the lab |
-| `relayforge-stack.service` was `failed` | A previous Compose start failed, and systemd retained the result even though the containers later became healthy | Repair the key permission and restart through the installer |
-| `job-signing.pem` was mode `0644` | The file-level mode was broader than the enforced signing-key contract | Restore `root:relayforge-signing` mode `0440` |
-| `relay-cleanup.timer` and `relay-rotate.timer` were enabled | Obsolete units from the earlier rotating design were invoking scripts that no longer exist | Disable those timers once |
-| The Worker contained `HTTP/1.1` and `/relay/` | The installed binary supported both browser forwarding and the challenge protocol | Do not replace it from an old extraction |
-| No Worker unit was active | No live participant session needed to be interrupted | Maintenance could proceed |
-| The home-directory ZIP was older than the latest local release | An old ZIP or `/tmp` tree could reinstall stale code | Upload and freshly extract the current release |
-| Root filesystem usage was about 29 percent | There was no storage emergency | Do not run broad Docker pruning |
-
-This is an in-place repair and upgrade, not a reset.
-
-The active deployment lives in:
+Every install removes unsupported files from those three `/opt` trees and
+removes these five exact legacy units:
 
 ```text
-/opt/relayforge       installed application, Worker, and host runtime
-/etc/relayforge       generated configuration, TLS material, and signing keys
-/var/lib/relayforge   Worker state and generated root flag
-Docker volume         persistent PostgreSQL data
+relay-cleanup.service
+relay-cleanup.timer
+relay-rotate.service
+relay-rotate.timer
+relay-worker.service
 ```
 
-Old ZIPs, exports, `supervisor.py.fixed`, and similar home-directory files are
-inactive artifacts. They do not need to be deleted to repair the application.
+The installer also removes the exact previously inventoried bounded-root
+`/etc/systemd/system/relay-supervisor.service.d/override.conf`. That file kept
+only five Linux capabilities and therefore prevented this variant from
+delivering unrestricted host root. Its useful
+`RuntimeDirectoryPreserve=yes` setting now lives in the canonical unit, which
+also explicitly resets `CapabilityBoundingSet=~` to all capabilities supported
+by the kernel. If the directory contains any other drop-in, installation stops
+for manual review instead of deleting unknown administrator policy.
 
-## What each change does
+It preserves:
 
-| Change | Why it is needed | What it changes |
-|---|---|---|
-| Disable `relay-cleanup.timer` and `relay-rotate.timer` | They belong to the old rotating-Worker experiment. The current Supervisor owns the finite 30–420 second Worker lifecycle. | Stops obsolete jobs from repeatedly failing. It does not remove project data. |
-| Change the signing private key from `0644` to `0440` | The file-level mode granted an unnecessary “other read” bit and failed the least-privilege contract. | Root and the dedicated signing group receive read bits; no permission bits are granted to other identities. |
-| Verify the new ZIP and use a new extraction directory | A reused tree can contain an old Worker or manual partial fixes. | Makes the ZIP and its manifest the only installation source. |
-| Rerun `install.sh` | Reconciles application files, Worker binary, units, containers, firewall, and SSH policy. | Briefly interrupts the portal while preserving the database volume, flag, keys, certificate, and generated secrets. |
-| Clear historical failed transient units | Old failed tests remain visible in systemd after they finish. | Removes only cosmetic failure records; it does not delete a live Worker. |
-| Run hardening and end-to-end tests | Healthy containers alone do not prove the host Worker tunnel or flag chain. | Verifies both the security boundaries and actual challenge behavior. |
+- `/etc/relayforge` secrets, TLS material, endpoint settings, and signing key;
+- `/var/lib/relayforge` flag, stage markers, and transient Worker state;
+- the `relayforge_postgres_data` Docker volume;
+- active transient `relay-worker-<UUID>.service` units; and
+- the current five-container Compose project.
 
-After a successful start, `relayforge-stack.service` should be
-`active (exited)`. It is a successful `Type=oneshot` unit with
-`RemainAfterExit=yes`; `exited` does not mean the containers stopped.
+It refuses to proceed while a foreign container is running. It never runs
+`apt autoremove`, package-wide purges, Docker prune, volume deletion, home
+directory cleanup, or `/tmp` wildcards. “Essentials only” means an exact
+RelayForge-managed runtime on a normal Ubuntu/AWS host—not removal of Ubuntu,
+SSH, SSM/cloud agents, or unknown administrator data.
 
-## Safety rules
+## 1. Build and verify the release on the administrator Mac
 
-- Keep the current SSH session open and use a second terminal for the upload.
-- Do not print or share `/etc/relayforge/compose.env`; it contains passwords
-  and the Flask session secret.
-- Use the recorded endpoint `127.0.0.1:19001`. The installer rejects an
-  endpoint change against the existing persistent database.
-- Cancel or wait for any active Worker before replacing its executable.
-- Do not remove `/opt/relayforge`, `/etc/relayforge`, or
-  `/var/lib/relayforge`.
-- Do not run any of these as housekeeping:
+From the repository:
 
 ```bash
-sudo docker compose down --volumes
-sudo docker volume prune
-sudo docker system prune -a --volumes
-sudo /opt/relayforge/runtime/reset-lab.sh --yes
+cd "/Users/pengsbook/Documents/Schoolwork (SIT)/Y1T2/ICT2212/DaBox"
+
+python3 tests/check_integrated_stage.py
+python3 tests/test_python_syntax.py
+python3 tests/test_supervisor.py
+python3 tests/static_audit.py
+bash -n scripts/*.sh tests/*.sh
+./scripts/package-release.sh ..
+python3 tests/verify-release-bundle.py \
+  ../RelayForge-Responsibilities-Flask-v1.zip
 ```
 
-The Docker commands can destroy PostgreSQL data. `reset-lab.sh` deliberately
-creates a fresh challenge and rotates the flag.
+Docker-backed and nested-systemd suites should also pass on an AMD64 Docker
+host when available. The EC2 deployment verification and external acceptance
+later in this guide are mandatory even when local Docker is unavailable.
 
-## 1. Keep a recovery session open
+The two upload artifacts are:
 
-From the administrator's computer:
+```text
+../RelayForge-Responsibilities-Flask-v1.zip
+../RelayForge-Responsibilities-Flask-v1.zip.sha256
+```
+
+## 2. Keep one SSH recovery session open
+
+Protect the PEM, then connect:
 
 ```bash
+cd "/Users/pengsbook/Documents/Schoolwork (SIT)/Y1T2/ICT2212"
+chmod 600 ICT2212-AY26-T1-student30.pem
 ssh -i ./ICT2212-AY26-T1-student30.pem student30@18.216.228.46
 ```
 
-Why: RelayForge reapplies host firewall and SSH settings. An already
-authenticated terminal remains available for diagnosis during the short
-restart window.
+The PEM belongs only to administrators. Never give it to a player: this
+account has passwordless sudo and Docker access, either of which is an
+immediate host-root shortcut unrelated to the challenge.
 
-The earlier `Can't assign requested address` SSH message was a client-side
-temporary socket error. It was not evidence that RelayForge had deleted the
-EC2 or its files.
+Keep this terminal open. Use a second terminal for upload and deployment.
 
-## 2. Record the non-secret deployment settings
+## 3. Read-only host preflight
 
-On the EC2:
+On the EC2, record the current non-secret settings and workload boundary:
 
 ```bash
-ip -4 route show default
+uname -m
+. /etc/os-release
+printf '%s %s\n' "$ID" "$VERSION_ID"
 
+ip -4 route show default
 sudo sed -n \
   -e '/^PLAYER_CIDR=/p' \
   -e '/^PUBLIC_IFACE=/p' \
   -e '/^ENDPOINT_HOST=/p' \
   -e '/^ENDPOINT_PORT=/p' \
   /etc/relayforge/firewall.env
-
-sudo grep -E '^(RELAY_ENDPOINT_HOST|RELAY_ENDPOINT_PORT)=' \
-  /etc/relayforge/compose.env
-
 sudo grep '^ADMIN_USER=' /etc/relayforge/install.state
+
+sudo docker ps --format \
+  'table {{.Names}}\t{{.Status}}\t{{.Label "com.docker.compose.project"}}'
+sudo ss -ltnp
+sudo systemctl list-units --all --type=service 'relay-worker-*'
 ```
 
-Expected values for this EC2 are:
+Expected deployment values for this EC2 are:
 
 ```text
-PLAYER_CIDR=0.0.0.0/0
-PUBLIC_IFACE=ens5
-ADMIN_USER=student30
-RELAY_ENDPOINT_HOST=127.0.0.1
-RELAY_ENDPOINT_PORT=19001
+Architecture:        x86_64
+Ubuntu:              24.04
+PLAYER_CIDR:         0.0.0.0/0
+PUBLIC_IFACE:        ens5
+ADMIN_USER:          student30
+ENDPOINT_HOST:       127.0.0.1
+ENDPOINT_PORT:       19001
+Compose project:     relayforge only
 ```
 
-`0.0.0.0/0` means Ubuntu permits HTTPS and temporary Worker traffic from any
-IPv4 source. It does not modify the AWS Security Group; AWS must also allow
-the relevant ports.
+Stop if any running container is not labelled with Compose project
+`relayforge`, if another service owns TCP 443, or if the endpoint differs from
+the recorded database deployment. Resolve that ownership explicitly; do not
+delete an unknown workload.
 
-## 3. Confirm that no Worker is active
+The installer preserves active Workers. A Worker already in memory continues
+using its old binary until cancellation or expiry, so acceptance must create a
+new request after the update.
 
-```bash
-sudo systemctl list-units \
-  --state=running \
-  --type=service \
-  'relay-worker-*'
-```
+## 4. Upload a freshly packaged release
 
-No matching `relay-worker-*` service row is expected during maintenance
-(systemd may still print headings or a footer). If a Worker appears, close it
-through the portal or wait for its requested lifetime to expire. Replacing an
-executable does not update an already running process because Linux continues
-executing its loaded image.
-
-## 4. Upload the authoritative release from the administrator's computer
-
-Open a second terminal on the Mac:
+From a second Mac terminal:
 
 ```bash
 cd "/Users/pengsbook/Documents/Schoolwork (SIT)/Y1T2/ICT2212"
-chmod 600 ICT2212-AY26-T1-student30.pem
 
 ssh -i ./ICT2212-AY26-T1-student30.pem \
   student30@18.216.228.46 \
-  'mkdir -p "$HOME/relayforge-upgrade-20260924"'
+  'install -d -m 0700 "$HOME/relayforge-upgrade"'
 
 scp -i ./ICT2212-AY26-T1-student30.pem \
-  relayforge-lab/responsibilities/release/RelayForge-Responsibilities-Flask-v1.zip \
-  relayforge-lab/responsibilities/release/RelayForge-Responsibilities-Flask-v1.zip.sha256 \
-  student30@18.216.228.46:~/relayforge-upgrade-20260924/
+  RelayForge-Responsibilities-Flask-v1.zip \
+  RelayForge-Responsibilities-Flask-v1.zip.sha256 \
+  student30@18.216.228.46:~/relayforge-upgrade/
 ```
 
-What this means:
+Upload the ZIP and checksum together. Uploading does not modify the running
+stack.
 
-- `chmod 600` makes the PEM readable and writable only by its owner. OpenSSH
-  rejects private keys with broad permissions.
-- `scp -i` authenticates with that PEM and transfers the two release files.
-- The separate upgrade directory preserves the old ZIP and teammate exports.
-- The `.sha256` sidecar identifies the exact ZIP that should be installed.
-- Uploading does not change the running application.
-
-Windows PowerShell equivalent:
-
-```powershell
-$Key = ".\ICT2212-AY26-T1-student30.pem"
-icacls $Key /inheritance:r
-icacls $Key /grant:r "$($env:USERNAME):(R)"
-
-ssh -i ".\ICT2212-AY26-T1-student30.pem" `
-  student30@18.216.228.46 `
-  "mkdir -p ~/relayforge-upgrade-20260924"
-
-scp -i ".\ICT2212-AY26-T1-student30.pem" `
-  ".\relayforge-lab\responsibilities\release\RelayForge-Responsibilities-Flask-v1.zip" `
-  ".\relayforge-lab\responsibilities\release\RelayForge-Responsibilities-Flask-v1.zip.sha256" `
-  "student30@18.216.228.46:~/relayforge-upgrade-20260924/"
-```
-
-The two `icacls` commands remove inherited Windows ACL entries and grant the
-current Windows account read access. Use them if Windows OpenSSH reports that
-the private key permissions are too open. They change only the local PEM file,
-not the EC2 account or server.
-
-## 5. Verify and freshly extract the uploaded ZIP
-
-```bash
-cd ~/relayforge-upgrade-20260924
-sha256sum -c RelayForge-Responsibilities-Flask-v1.zip.sha256
-```
-
-Expected:
-
-```text
-RelayForge-Responsibilities-Flask-v1.zip: OK
-```
-
-Do not install if this fails. It indicates an incomplete transfer or a ZIP and
-sidecar from different builds.
-
-Create a new extraction directory every time:
-
-```bash
-RF_RELEASE_ZIP=$(readlink -f RelayForge-Responsibilities-Flask-v1.zip)
-RF_RELEASE_STAGE=$(mktemp -d /tmp/relayforge-release.XXXXXX)
-
-unzip -q "$RF_RELEASE_ZIP" -d "$RF_RELEASE_STAGE"
-cd "$RF_RELEASE_STAGE/RelayForge-Responsibilities-Flask-v1"
-
-python3 tests/verify-release-bundle.py "$RF_RELEASE_ZIP"
-python3 tests/check_shared_snapshot.py
-python3 tests/check_integrated_stage.py
-```
-
-The checks have different purposes:
-
-1. `sha256sum -c` proves the transferred ZIP matches its sidecar.
-2. `verify-release-bundle.py` rejects unsafe paths, symlinks, secret material,
-   missing files, CRC damage, and archive-manifest mismatches.
-3. `check_shared_snapshot.py` verifies every extracted source file against
-   `MANIFEST.sha256`.
-4. `check_integrated_stage.py` checks that the complete deployable Flask
-   integration is present.
-
-A fresh directory matters because the installer compiles
-`worker/relay-worker.c` from its source tree. Reusing an old `/tmp` extraction
-can silently reinstall an obsolete Worker even if a new ZIP is in the home
-directory.
-
-Do not make host or service changes until every command in this section passes.
-
-## 6. Disable obsolete lifecycle units
+## 5. Verify and extract once on the EC2
 
 On the EC2:
 
 ```bash
-sudo systemctl disable --now \
-  relay-cleanup.timer \
-  relay-rotate.timer 2>/dev/null || true
+cd ~/relayforge-upgrade
+sha256sum -c RelayForge-Responsibilities-Flask-v1.zip.sha256
 
-sudo systemctl stop \
-  relay-cleanup.service \
-  relay-rotate.service 2>/dev/null || true
+RF_RELEASE_STAGE=$(mktemp -d /tmp/relayforge-release.XXXXXX)
+unzip -q RelayForge-Responsibilities-Flask-v1.zip -d "$RF_RELEASE_STAGE"
+cd "$RF_RELEASE_STAGE/RelayForge-Responsibilities-Flask-v1"
 
-sudo systemctl reset-failed \
-  relay-cleanup.service \
-  relay-cleanup.timer \
-  relay-rotate.service \
-  relay-rotate.timer 2>/dev/null || true
+python3 tests/verify-release-bundle.py \
+  "$HOME/relayforge-upgrade/RelayForge-Responsibilities-Flask-v1.zip"
+python3 tests/check_shared_snapshot.py
+python3 tests/check_integrated_stage.py
 ```
 
-Why:
+All checks must pass. Never reinstall from an old `/tmp/relayforge-release.*`
+directory; that is how an outdated Worker can reappear after the ZIP changes.
 
-- `relay-rotate.timer` belongs to the separate seven-minute Worker design.
-- `relay-cleanup.timer` calls an old script; current Supervisor reaps expired
-  Workers itself.
-- `disable --now` stops future activation and stops the timers now.
-- `stop` ends an old service if it happens to be running.
-- `reset-failed` clears only the historical red status.
+## 6. Repair only known pre-existing drift
 
-The old unit files may remain disabled under `/etc/systemd/system`. Keeping
-them is reversible and does not affect the bounded deployment.
-
-## 7. Repair the signing private key boundary
+The installer refuses an unsafe existing signing key instead of silently
+blessing it. If inspection shows the known historical mode drift, confirm it
+is a regular root-owned file inside the root-only secrets directory, then
+restore the contract:
 
 ```bash
+sudo stat -c '%F %U:%G %a %n' \
+  /etc/relayforge/secrets \
+  /etc/relayforge/secrets/job-signing.pem
+sudo test ! -L /etc/relayforge/secrets/job-signing.pem
+sudo test "$(sudo stat -c '%U' /etc/relayforge/secrets/job-signing.pem)" = root
 sudo chown root:relayforge-signing \
   /etc/relayforge/secrets/job-signing.pem
-
-sudo chmod 0440 \
-  /etc/relayforge/secrets/job-signing.pem
-
-sudo stat -c '%U:%G %a %n' \
-  /etc/relayforge/secrets/job-signing.pem
+sudo chmod 0440 /etc/relayforge/secrets/job-signing.pem
 ```
 
-Expected result:
+This is a repair for this inventoried lab host, not a generic response to a
+leaked key. If untrusted users could have read the key, rebuild the disposable
+instance and generate new secrets.
 
-```text
-root:relayforge-signing 440 /etc/relayforge/secrets/job-signing.pem
-```
-
-Verify that the running Access container retains its intended read access:
+If the old host nginx package remains, first prove that it is the disabled
+conflicting service and that no unrelated site needs it:
 
 ```bash
-sudo docker compose \
-  --project-directory /opt/relayforge/app \
-  --env-file /etc/relayforge/compose.env \
-  exec -T access \
-  sh -c 'id; test -r /run/secrets/job-signing.pem && echo "PASS: signing key readable"'
+sudo systemctl is-active nginx.service || true
+sudo dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package}\n' \
+  nginx nginx-common nginx-core 2>/dev/null || true
 ```
 
-`0440` sets owner-read and group-read, sets no “other” permissions, and sets no
-write or execute bits. The root-only `0700` parent directories already prevent
-ordinary host users from traversing to the key; the tighter file mode also
-enforces the intended least-privilege boundary when Docker bind-mounts the
-file into Access. Access receives the numeric `relayforge-signing` group
-through Compose. Supervisor is configured with and uses only the public
-verification key; Access performs the signing step.
-
-The audited Access container used supplementary GID `985`, matching the host
-signing group. Tightening `0644` to `0440` therefore removes the unnecessary
-file-level other-read bit without breaking Access. The installer deliberately
-rejects an existing private key with unsafe permissions, so this repair must
-happen before step 8.
-
-## 8. Historical bounded-build installer step — do not use for this branch
-
-Do not run this unrestricted-root branch on the existing shared EC2. The
-acknowledgement flag below is appropriate only on a newly provisioned,
-disposable instance.
-
-From the fresh extracted directory:
+On this dedicated challenge EC2, those positively identified nginx packages
+may be removed because TLS is provided by the `relayforge-edge-1` container:
 
 ```bash
+sudo systemctl disable --now nginx.service 2>/dev/null || true
+sudo apt-get purge -y nginx nginx-common nginx-core
+```
+
+Do not generalize this into a package purge on another host.
+
+## 7. Run the idempotent installer
+
+From the freshly extracted release root:
+
+```bash
+PUBLIC_IFACE=$(ip -4 route show default | \
+  awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+ADMIN_USER=$(id -un)
+
 sudo ./scripts/install.sh \
   --acknowledge-unrestricted-root \
   --player-cidr 0.0.0.0/0 \
-  --public-interface ens5 \
-  --admin-user student30 \
+  --public-interface "$PUBLIC_IFACE" \
+  --admin-user "$ADMIN_USER" \
   --endpoint-host 127.0.0.1 \
   --endpoint-port 19001
 ```
 
-Argument meanings:
+The installer stops only the services whose files it replaces, reconciles the
+three managed trees, removes the five exact legacy units, builds/pulls the
+stack, restores the firewall and SSH policy, and runs hardening verification.
+The PostgreSQL volume, flag, secrets, and active Worker state remain intact.
 
-| Argument | Meaning on this EC2 |
-|---|---|
-| `--acknowledge-unrestricted-root` | Accepts that a participant can execute arbitrary commands as host UID 0; never use it on a shared or valuable host. |
-| `--player-cidr 0.0.0.0/0` | Ubuntu permits portal and Worker traffic from any IPv4 source that AWS also allows. |
-| `--public-interface ens5` | Public traffic arrives at the instance through `ens5`. |
-| `--admin-user student30` | SSH hardening preserves key-only administration for this account. |
-| `--endpoint-host 127.0.0.1` | The sample HTTP endpoint is host-local and not directly public. |
-| `--endpoint-port 19001` | Workers may reach only this registered endpoint port. |
+`relayforge-stack.service` is a successful oneshot service, so
+`active (exited)` is the expected state.
 
-There is no separate `--admin-cidr` in this release. Ubuntu permits key-only
-SSH on the public interface; the AWS Security Group separately decides which
-sources can reach TCP 22. Anyone with the PEM can attempt administration, so
-the PEM is the critical SSH credential.
-
-The installer:
-
-1. validates Ubuntu 24.04 AMD64 and the service identities;
-2. installs the required Ubuntu packages;
-3. updates `/opt/relayforge` from this verified source;
-4. recompiles the native Worker with PIE, NX, stack protection, and full
-   RELRO;
-5. retains and validates the existing generated environment and keys;
-6. reapplies sysctl, SSH, and firewall policy;
-7. rebuilds the Web, Access, and Dispatcher images; and
-8. restarts the backend, Supervisor, firewall, and five-container stack.
-
-The PostgreSQL named volume remains intact. `init-challenge.sh` retains an
-existing safe root flag unless explicitly invoked with `--rotate`. Expect
-brief downtime because Docker and the application stack are restarted.
-
-## 9. Clear historical transient-unit failures
+## 8. Verify installed footprint and health
 
 ```bash
-sudo systemctl reset-failed \
-  relay-cleanup.service \
-  relay-cleanup.timer \
-  relay-rotate.service \
-  relay-rotate.timer \
-  'relay-worker-*.service' \
-  'test-worker*.service' 2>/dev/null || true
-```
+sudo /opt/relayforge/runtime/verify-hardening.sh
 
-This removes records from earlier failed test or transient units. It does not
-repair a current failure and does not delete Worker data. Do not reset an
-unrelated AWS SSM Agent failure without diagnosing that service separately.
-
-## 10. Verify the installed host
-
-```bash
-sudo systemctl status relayforge-stack.service --no-pager
+sudo systemctl is-active \
+  docker.service \
+  relay-backend.service \
+  relay-supervisor.service \
+  relayforge-firewall.service \
+  relayforge-stack.service
 
 sudo docker compose \
   --project-directory /opt/relayforge/app \
   --env-file /etc/relayforge/compose.env \
   ps
 
-sudo /opt/relayforge/runtime/verify-hardening.sh
-
-curl --fail http://127.0.0.1:19001/health
-curl --fail --insecure https://127.0.0.1/healthz
-
-sudo strings /opt/relayforge/bin/relay-worker | grep -F 'HTTP/1.1'
-sudo strings /opt/relayforge/bin/relay-worker | grep -F '/relay/'
+sudo find /opt/relayforge -maxdepth 3 -printf '%M %u:%g %p\n' | sort
+sudo systemctl list-unit-files \
+  relay-cleanup.service relay-cleanup.timer \
+  relay-rotate.service relay-rotate.timer relay-worker.service
 ```
 
-Expected results:
+Hardening verification must report zero failures. Compose must show exactly
+five healthy containers. The legacy-unit query must show no installed unit
+files. Stage-marker checks must prove:
 
-- the stack unit is `active (exited)`;
-- exactly five containers are `Up` and `healthy`;
-- deployment verification reports zero failures, including the explicit
-  unrestricted-Supervisor assertion;
-- both local health requests succeed; and
-- Worker strings include both `HTTP/1.1` and `/relay/`.
+- Web UID 65532 can read Stage 1, but HTTP cannot fetch it directly;
+- host `relay` can read Stage 2 but not Stage 3 or `root.txt`; and
+- only UID 0 can read Stage 3 and the generated root flag.
 
-Verification proves the remaining permissions and isolation and confirms that
-the Supervisor is deliberately unrestricted. It does not by itself prove that
-the intended vulnerability reaches UID 0.
-
-## 11. Run complete application acceptance
-
-From the fresh release directory:
+Run the local functional suite from the extracted release root:
 
 ```bash
 ./tests/run-vm.sh https://127.0.0.1
 ```
 
-This runs:
-
-- `negative_paths.py`, which proves authentication, rejection behavior, a
-  genuine browser/CONNECT tunnel, and cancellation; and
-- `full_chain.py`, which exercises the intentional Web, database, Worker, and
-  Supervisor vulnerabilities.
-
-A complete pass proves `ROOT_UID=0` and prints a generated `RF{...}` value. Do
-not copy that value into source control. Destroy/reimage the VM afterward.
-
-## 12. Test from a participant browser
-
-Open:
-
-```text
-https://18.216.228.46/login
-```
-
-Credentials:
-
-```text
-Username: guest
-Password: guest-relay-2026
-```
-
-The TLS warning is expected because this disposable lab uses a self-signed
-certificate. Confirm the assigned IP before accepting it.
-
-An approved request displays a URL resembling:
-
-```text
-http://18.216.228.46:25037/relay/<48-hex-token>/
-```
-
-The temporary Worker uses plain HTTP. Its port and token change for each
-request and disappear on expiry or cancellation.
-
-The AWS owner must permit the intended participant sources to reach:
-
-```text
-TCP 443          HTTPS portal
-TCP 25000-25099 temporary Worker listeners
-TCP 22           key-only administrator SSH
-```
-
-Do not expose TCP 19001, 5432, or 8080. Ubuntu commands cannot edit the AWS
-Security Group. If local acceptance passes but a teammate times out, the
-remaining boundary is probably AWS or the teammate's network.
-
-Opening all three public ranges to `0.0.0.0/0` is acceptable only for a
-disposable CTF instance with no sensitive data or privileged IAM role. It
-makes possession of the PEM the primary SSH boundary.
-
-## 13. Failure handling
-
-Do not reset the database after an installation error. Collect evidence:
+Then run external negative and full-chain acceptance from the Mac so AWS and
+host firewall behavior are included:
 
 ```bash
-sudo systemctl status relayforge-stack.service --no-pager
-sudo journalctl -u relayforge-stack.service -n 200 --no-pager
-sudo journalctl -u relay-supervisor.service -n 200 --no-pager
-
-sudo docker compose \
-  --project-directory /opt/relayforge/app \
-  --env-file /etc/relayforge/compose.env \
-  ps -a
-
-sudo docker compose \
-  --project-directory /opt/relayforge/app \
-  --env-file /etc/relayforge/compose.env \
-  logs --tail=200
-
-sudo stat -c '%U:%G:%a %n' \
-  /etc/relayforge/secrets/job-signing.pem \
-  /etc/relayforge/job-signing.pub \
-  /var/lib/relayforge/flag/root.txt
+cd "/Users/pengsbook/Documents/Schoolwork (SIT)/Y1T2/ICT2212/DaBox"
+python3 tests/negative_paths.py https://18.216.228.46
+python3 attacks/full_chain.py https://18.216.228.46
 ```
 
-Correct permission results are:
+The full chain must prove `ROOT_UID=0`,
+`ROOT_STAGE=3_UNRESTRICTED_HOST_ROOT`, and an `RF{...}` flag.
 
-```text
-root:relayforge-signing:440 /etc/relayforge/secrets/job-signing.pem
-root:root:444              /etc/relayforge/job-signing.pub
-root:root:600              /var/lib/relayforge/flag/root.txt
-```
+## 9. One-time cleanup of inventoried historical artifacts
 
-Correct the specific logged error and rerun the same verified installer with
-the same endpoint values.
-
-There is no automatic application-file rollback. If the new release proves
-faulty, verify a previously known-good ZIP and rerun its `install.sh` with the
-same player CIDR, interface, admin user, and endpoint values. That reinstalls
-the older application files while retaining the PostgreSQL volume, generated
-keys, certificate, and root flag. Do not use `docker compose down --volumes`
-or `reset-lab.sh` as a rollback mechanism; those operations destroy or rotate
-challenge state. If the AWS owner can take an EC2 snapshot before maintenance,
-that provides the strongest whole-instance rollback because `install.sh` is
-an in-place reconciliation rather than a transactional update.
-
-If a browser reports `ERR_INVALID_HTTP_RESPONSE` on a Worker URL, verify the
-Worker markers shown in step 10. Missing markers mean an obsolete binary was
-installed from a stale tree.
-
-## 14. Optional maintenance after acceptance
-
-No filesystem or Docker cleanup is currently required. Preserve old teammate
-exports until the team agrees they are unnecessary. Safe inspection commands
-are:
+This is separate from the installer. First print each candidate and confirm it
+is the previously inventoried RelayForge scratch/export artifact:
 
 ```bash
-df -h /
-sudo docker system df
-sudo systemctl --failed
-
-sudo find /tmp -maxdepth 1 -type d \
+find "$HOME" -maxdepth 1 -mindepth 1 -printf '%f\n' | sort
+sudo find /tmp -maxdepth 1 -mindepth 1 \
   \( -name 'relayforge-release.*' \
      -o -name 'relayforge-deploy.*' \
+     -o -name 'relayforge-update.*' \
      -o -name 'relayforge-worker-fix.*' \) \
-  -print
+  -printf '%u:%g %p\n' | sort
 ```
 
-Do not use a broad `rm -rf /tmp/relayforge-*` command. Identify any exact path
-before removing it.
+Only after matching the read-only inventory, remove exact obsolete home paths
+one by one. For this EC2 the historical candidates were:
 
-After application and attack acceptance both pass, install Ubuntu security
-updates only in a planned maintenance window, preferably after the AWS owner
-takes an EC2 snapshot. Package upgrades and a reboot are disruptive:
+```text
+~/apache-site
+~/db-export
+~/relayforge-db
+~/relayforge-export
+~/relayforge-export.tar.gz
+~/gid  ~/pid  ~/pw_uid  ~/uid
+~/supervisor.py.fixed
+~/verify-hardening.sh.fixed
+```
+
+Keep the current `~/relayforge-upgrade` ZIP/checksum until acceptance is
+complete. For `/tmp`, remove only exact printed paths from the inventory;
+never delete a `systemd-private-*` directory or use `rm -rf /tmp/relayforge-*`.
+
+Do not use any of these for cleanup:
 
 ```bash
-sudo apt-get update
-sudo apt-get upgrade -y
-test ! -e /var/run/reboot-required || sudo reboot
+sudo apt-get autoremove
+sudo docker system prune -a --volumes
+sudo docker volume prune
+sudo docker compose down --volumes
 ```
 
-Repeat the service, container, and hardening checks after any reboot.
+They have a broader ownership boundary than this runbook can prove.
+
+## 10. Failure and rollback rules
+
+- If checksum or manifest verification fails, do not install; repackage and
+  upload both files again.
+- If the installer reports a foreign running container, identify its owner
+  instead of deleting it.
+- If TCP 443 remains occupied after RelayForge stops, inspect the reported PID
+  and resolve that exact service.
+- If a Worker already exists, create a new request after the update before
+  judging the new binary.
+- Collect `systemctl status`, `journalctl -u`, and Compose logs before changing
+  more files.
+- `reset-lab.sh --yes` destroys challenge database state and rotates the flag;
+  it is not routine cleanup.
+- After a participant obtains unrestricted host root, do not rely on the
+  installer, reset script, antivirus scan, or manual deletion. Destroy and
+  recreate the EC2 from a known-good image.

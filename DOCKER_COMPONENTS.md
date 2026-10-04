@@ -18,6 +18,9 @@ Dockerfiles. Tags in this table are human-readable labels only.
 
 ## Included Docker inputs
 
+The verified repository/release contains the following Docker-related source
+inputs:
+
 ```text
 compose.yaml
 .env.example
@@ -25,6 +28,8 @@ config/nginx.conf
 web/Dockerfile
 web/.dockerignore
 web/requirements.txt
+web/prefs.py
+web/STAGE_1_WEB.txt
 web/app/
 web/templates/
 web/static/
@@ -40,6 +45,16 @@ tests/systemd/Dockerfile
 creates `/etc/relayforge/compose.env` with fresh deployment secrets and never
 copies a development `.env` into the release.
 
+The host installation is deliberately smaller than the repository. Under
+`/opt/relayforge/app`, it keeps only `compose.yaml`, `config/nginx.conf`, the
+seven files required to build the control image, the two `db/init` files, and
+the Web Dockerfile/build inputs listed in `CONTRACTS.md`. Repository-only
+`web/tests/`, `web/tools/`, documentation, attack helpers, test Compose files,
+and the nested-systemd Dockerfile are not installed there. Beyond installed
+Python dependencies, the Web Dockerfile copies only its requirements file,
+application modules, templates, CSS, `prefs.py`, and the Stage 1 marker into
+its final image.
+
 ## Networks and data
 
 | Compose object | Role |
@@ -53,6 +68,15 @@ Only nginx publishes a Docker port. PostgreSQL and Flask are not bound to host
 ports. Dispatcher receives the host Supervisor socket as a read-only bind; the
 Access container receives only the signing private key it needs; nginx receives
 only the TLS directory.
+
+The Web image bakes in the read-only Stage 1 learning marker. The host-only
+`/var/lib/relayforge/stages` directory is not mounted into any container, so
+neither Stage 2 nor Stage 3 becomes a Docker-to-host shortcut.
+
+There is no marker in PostgreSQL. Exercising a database RPC proves a control
+plane capability, not another privilege level. UID 0 in any container also is
+not the Stage 3 condition: container root stays inside that container's mount
+and namespace boundary and lacks the host-root Supervisor's access.
 
 ## Components deliberately not containerized
 
@@ -74,9 +98,31 @@ host port from `25000-25099`.
 The final escalation is likewise not a Docker escape. After the player gains a
 sandboxed `relay` shell in that native Worker, the host-root Supervisor's
 intentional diagnostic TOCTOU executes a replacement pathname as UID 0. In this
-variant the Supervisor service is deliberately unrestricted, so success means
-real root on the Ubuntu host. See `UNRESTRICTED_ROOT_WARNING.md` before running
-it.
+variant the Supervisor service is deliberately unrestricted and explicitly
+resets its systemd capability bounding set to every kernel capability, so
+success means real root on the Ubuntu host. See
+`UNRESTRICTED_ROOT_WARNING.md` before running it.
+
+## Host installation reconciliation
+
+The other two deployed `/opt` allowlists are the nine files in
+`/opt/relayforge/runtime` and the single
+`/opt/relayforge/bin/relay-worker` binary documented in `CONTRACTS.md`.
+Ordinary installation removes obsolete entries only inside the three managed
+`/opt/relayforge/{app,runtime,bin}` trees. It also removes exactly
+`relay-cleanup.service`, `relay-cleanup.timer`, `relay-rotate.service`,
+`relay-rotate.timer`, and the old permanent `relay-worker.service`.
+It also removes only the recognized bounded-root
+`relay-supervisor.service.d/override.conf`; an unknown drop-in is a hard error.
+The useful socket-directory preservation from that prototype is now part of
+the canonical Supervisor unit.
+
+This is bounded reconciliation, not a host purge. The installer preserves
+unrelated containers and images, Docker volumes, package selections, user
+files, generated secrets, PostgreSQL data, and existing challenge state. It
+does not run Docker prune, volume deletion, package autoremove/purge, or broad
+filesystem cleanup; it refuses to continue if another project has a running
+container.
 
 ## Test-only containers
 

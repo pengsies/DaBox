@@ -5,6 +5,8 @@
 !host/
 !host/supervisor.py
 !host/backend.py
+!host/STAGE_2_WORKER.txt
+!host/STAGE_3_ROOT.txt
 !host/relay-supervisor.service
 !host/relay-backend.service
 !tests/

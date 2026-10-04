@@ -5,15 +5,14 @@
 > with no IAM role, reusable credentials, sensitive data, or other workloads.
 > Read `UNRESTRICTED_ROOT_WARNING.md` before installation.
 
-This directory is a self-contained deployment root for the bounded-lifetime
-RelayForge variant. Its public Web application is Flask served by Gunicorn
+This repository is the self-contained deployment root for the bounded-lifetime
+RelayForge challenge. Its public Web application is Flask served by Gunicorn
 behind nginx HTTPS. PostgreSQL, Access, and Dispatcher run in Docker; the
 privileged Supervisor, transient Workers, firewall, and sample endpoint run as
 host services on Ubuntu.
 
-The parent `relayforge-lab/` is a separate PHP/rotating variant. Do not replace
-this directory's bounded 30–420 second Worker lifecycle with the parent's
-seven-minute restart model.
+Each accepted Worker has one bounded 30–420 second lifetime. There is no
+periodic seven-minute rotation or permanent Worker service in this deployment.
 
 ## Integrated path
 
@@ -35,15 +34,39 @@ Access/Worker parser differential, exploits the legacy Worker callback, and
 finishes by racing a validated diagnostic pathname into an unrestricted host
 root shell.
 
+## Access checkpoints
+
+Three non-secret text breadcrumbs make the privilege transitions visible:
+
+| Marker | Meaning | Can read it |
+|---|---|---|
+| `STAGE_1_WEB.txt` | Command execution in the Web container | Web UID 65532 |
+| `STAGE_2_WORKER.txt` | Command execution in a native host Worker | Host `relayforge-ipc` group; normally the `relay` Worker |
+| `STAGE_3_ROOT.txt` | Unrestricted host-root execution | Host UID 0 only |
+
+Their exact runtime paths, modes, and limitations are in `STAGE_MARKERS.md`.
+They are source-known learning breadcrumbs, not scoring secrets. The only real
+flag remains the randomly generated, root-only
+`/var/lib/relayforge/flag/root.txt`.
+
+Stage 2 is group-readable because both native host identities that use the
+Supervisor socket have `relayforge-ipc` as their primary group. The deployed
+Dispatcher is a container without the host marker directory mounted, so its
+matching numeric group does not make the file visible inside that container.
+There is intentionally no database marker: reaching a PostgreSQL RPC or a
+container UID 0 proves neither native-Worker access nor host root. Container
+root remains constrained by that container's mounts, namespaces, dropped
+capabilities, and no-new-privileges policy.
+
 ## Directory map
 
 | Path | Purpose |
 |---|---|
-| `web/` | Flask/Gunicorn application, teammate-derived UI, restricted DB calls, and intentional pickle gadget |
+| `web/` | Flask/Gunicorn UI, restricted DB calls, and intentional pickle gadget |
 | `config/nginx.conf` | TLS edge, request limits, security headers, and proxy to `web:8080` |
 | `db/init/` | Canonical schema, seed data, separate service roles, and restricted RPC state machine |
 | `control/` | Access Controller and Dispatcher containers |
-| `host/` | Supervisor, backend endpoint, firewall logic, cleanup, and systemd units |
+| `host/` | Supervisor, backend endpoint, firewall logic, state cleanup, and systemd units |
 | `worker/` | Native token-gated tunnel and intentional legacy callback flaw |
 | `scripts/` | Installer, initialization, reset, firewall, SSH, and verification lifecycle |
 | `tests/` | Source, component, container, endpoint, systemd, and VM acceptance tests |
@@ -54,12 +77,41 @@ root shell.
 | `WEB_REQUIRED.md` | Implemented Flask-specific Web contract |
 | `SETUP.md` | Windows VM creation, Ubuntu Server installer choices, deployment, and acceptance |
 | `UNRESTRICTED_ROOT_WARNING.md` | Mandatory deployment-risk and disposal guidance for this branch |
+| `STAGE_MARKERS.md` | Exact three-stage access breadcrumbs, permissions, and interpretation |
 | `EC2_RECOVERY_AND_UPGRADE.md` | Current-EC2 repair, upgrade rationale, verification, and recovery procedure |
 | `DOCKER_COMPONENTS.md` | Exact five-container inventory and host/container boundary |
 
-The original teammate Flask prototypes are retained outside deployment at
-`../diff/teammate-web-source/`; `../diff/WEB.md` records what was retained and
-what had to be adapted.
+## Installed footprint and bounded reconciliation
+
+The repository is an organizer/source tree; the installer does not copy it
+wholesale onto the host. It reconciles three root-owned `/opt` trees to explicit
+allowlists:
+
+```text
+/opt/relayforge/app/       compose.yaml plus only the nginx, control, DB-init,
+                          and Web Docker build inputs
+/opt/relayforge/runtime/   backend.py, cleanup_state.py, configure-firewall.sh,
+                          firewall.py, harden-ssh.sh, init-challenge.sh,
+                          reset-lab.sh, supervisor.py, verify-hardening.sh
+/opt/relayforge/bin/       relay-worker
+```
+
+Repository documentation, tests, attack helpers, `web/tests/`, and
+`web/tools/` remain in the verified source/release bundle but are absent from
+the installed `/opt/relayforge` tree and from the Web image. On an upgrade,
+entries outside these allowlists are removed only from those three managed
+trees.
+
+The installer also disables and removes exactly five obsolete prototype units:
+`relay-cleanup.service`, `relay-cleanup.timer`, `relay-rotate.service`,
+`relay-rotate.timer`, and the permanent `relay-worker.service`. It does not use
+a wildcard, so transient `relay-worker-<UUID>.service` units are not selected.
+It does not prune Docker globally, remove volumes, purge packages, delete user
+home or `/tmp` files, or rotate existing secrets and the root flag. Existing
+`/etc/relayforge`, PostgreSQL volume data, and `/var/lib/relayforge` state are
+preserved unless the operator explicitly runs the destructive reset command.
+The installer refuses to proceed while an unrelated running container is
+present rather than interrupting it during Docker package reconciliation.
 
 ## Quick verification
 
@@ -115,7 +167,10 @@ reliably run systemd.
 - Worker has no database credential and can reach only the configured canonical
   IPv4/port endpoint under the host firewall policy.
 - The root Supervisor deliberately runs without its former systemd sandbox so
-  the final diagnostic race produces genuine, unrestricted host root.
+  the final diagnostic race produces genuine, unrestricted host root. Its
+  unit explicitly resets `CapabilityBoundingSet=~` to the full kernel set and
+  preserves `/run/relayforge` across restarts so the Dispatcher bind mount
+  continues to refer to the live Supervisor socket directory.
 - A relay lasts its requested 30–420 seconds. An authenticated owner can also
   request cancellation; Dispatcher retries until Supervisor confirms stop.
 - `options_raw` controls only the safe/legacy parser exercise and never routing.

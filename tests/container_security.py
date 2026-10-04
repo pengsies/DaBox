@@ -119,6 +119,19 @@ def main() -> int:
                 raise AssertionError(f"{service} image is not AMD64")
 
         access_id = compose(args.secrets, "ps", "--quiet", "access").stdout.strip()
+        web_id = compose(args.secrets, "ps", "--quiet", "web").stdout.strip()
+        web_marker = subprocess.run(
+            [
+                "docker", "exec", web_id, "stat", "-c", "%u:%g:%a",
+                "/opt/relayforge/web/STAGE_1_WEB.txt",
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            timeout=5, check=True,
+        ).stdout.strip()
+        if web_marker != "0:0:444":
+            raise AssertionError(f"Web stage marker metadata changed: {web_marker}")
+        if "/var/lib/relayforge/stages" in json.dumps(inspect(web_id).get("Mounts", [])):
+            raise AssertionError("Web container received the host stage-marker directory")
         outbound = subprocess.run(
             [
                 "docker",

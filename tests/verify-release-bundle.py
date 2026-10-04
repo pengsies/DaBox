@@ -21,6 +21,7 @@ REQUIRED = {
     "DOCKER_COMPONENTS.md",
     "EC2_RECOVERY_AND_UPGRADE.md",
     "SETUP.md",
+    "STAGE_MARKERS.md",
     "UNRESTRICTED_ROOT_WARNING.md",
     "WEB_REQUIRED.md",
     "compose.yaml",
@@ -35,9 +36,12 @@ REQUIRED = {
     "scripts/package-release.sh",
     "scripts/reset-lab.sh",
     "host/supervisor.py",
+    "host/STAGE_2_WORKER.txt",
+    "host/STAGE_3_ROOT.txt",
     "worker/relay-worker.c",
     "attacks/full_chain.py",
     "web/Dockerfile",
+    "web/STAGE_1_WEB.txt",
     "web/app/__init__.py",
 }
 FORBIDDEN_SUFFIXES = {".key", ".p12", ".pem", ".pfx", ".pyc"}

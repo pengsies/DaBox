@@ -215,6 +215,19 @@ def exploit_raw(options: str) -> str:
     return str(uuid.UUID(matched.group(0)))
 
 
+def exploit_command(command: str) -> str:
+    completed = subprocess.run(
+        [
+            sys.executable, str(ROOT / "web/tools/exploit_stage1.py"), BASE,
+            "--username", GUEST_USER, "--password", GUEST_PASSWORD,
+            "--insecure", "--command", command,
+        ],
+        cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, timeout=25, check=True,
+    )
+    return completed.stdout
+
+
 def submit_raw_sql(secrets: Path, options: str) -> str:
     literal = options.replace("'", "''")
     output = sql(
@@ -295,6 +308,12 @@ def main() -> int:
 
         client, jar = opener()
         csrf = login(client, jar)
+
+        stage_one = exploit_command(
+            "id -u; cat /opt/relayforge/web/STAGE_1_WEB.txt"
+        )
+        if not stage_one.startswith("65532\n") or "RELAYFORGE_STAGE=1_WEB_CONTAINER" not in stage_one:
+            raise IntegrationError("Web RCE did not prove UID 65532 and read its stage marker")
 
         bad_status, bad_body = post_json(
             client, "/api/request",
@@ -398,6 +417,23 @@ def main() -> int:
         ).stdout
         if "docker.sock" in inspection or "job-signing.pem" in inspection:
             raise IntegrationError("web container received a host-control/signing mount")
+        marker_metadata = subprocess.run(
+            [
+                "docker", "exec", web_id, "stat", "-c", "%u:%g:%a",
+                "/opt/relayforge/web/STAGE_1_WEB.txt",
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            timeout=10, check=True,
+        ).stdout.strip()
+        if marker_metadata != "0:0:444":
+            raise IntegrationError(f"Web marker metadata changed: {marker_metadata!r}")
+        host_marker_probe = subprocess.run(
+            ["docker", "exec", web_id, "test", "-e", "/var/lib/relayforge/stages/STAGE_2_WORKER.txt"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+            check=False,
+        )
+        if host_marker_probe.returncode == 0:
+            raise IntegrationError("Web container can see a host stage marker")
     except (
         IntegrationError, OSError, ValueError, KeyError, json.JSONDecodeError,
         subprocess.SubprocessError,
@@ -405,8 +441,8 @@ def main() -> int:
         print(f"FAIL: container integration: {exc}", file=sys.stderr)
         return 1
     print(
-        "PASS: HTTPS→Flask authenticated pickle→raw RPC, safe API, "
-        "cancellation, parser differential, and Ed25519 integration"
+        "PASS: HTTPS→Flask stage-1 marker→raw RPC, safe API, cancellation, "
+        "parser differential, and Ed25519 integration"
     )
     return 0
 

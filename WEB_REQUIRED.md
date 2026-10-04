@@ -1,7 +1,7 @@
 # Flask Web integration contract
 
-The integrated `web/` is a Flask application based on the teammate Web
-prototype. nginx terminates TLS, Flask/Gunicorn serves the application, and the
+The integrated `web/` is the authoritative Flask application for this
+challenge. nginx terminates TLS, Flask/Gunicorn serves the application, and the
 canonical RelayForge database remains the sole source of user, target, request,
 and job state.
 
@@ -78,10 +78,26 @@ relay_web_api.cancel_request(text, uuid)
 available to the intentionally compromised Web process but must not be exposed
 by a normal public request route.
 
-The intentional Stage 1 vulnerability is the teammate Flask prototype's
-restricted-pickle gadget chain. Its exploit tooling and full-chain acceptance
-tests therefore use the Flask cookie/API contract rather than the superseded
-PHP `LegacyFormatter`, `ThemeWriter`, and `PendingExport` graph.
+The intentional Stage 1 vulnerability is the authenticated restricted-pickle
+gadget chain retained in this repository. Its exploit tooling and full-chain
+acceptance tests use the Flask cookie/API contract.
+
+## Stage and installation boundaries
+
+`STAGE_1_WEB.txt` is copied into the image as root-owned mode `0444`, then read
+by Web UID 65532 after the authenticated gadget establishes command execution.
+It is not served by a Flask or nginx route. The host Stage 2 and Stage 3 marker
+directory is never mounted into Web. Reaching the database, or even obtaining
+UID 0 inside this container, would not prove host Worker or host-root access;
+there is no database marker, and container root is distinct from Ubuntu-host
+UID 0.
+
+The repository keeps `web/tests/` and `web/tools/` for organizer verification.
+Neither directory is copied into `/opt/relayforge/app/web` by `install.sh` or
+into the final image by `web/Dockerfile`. The installed Web build context is
+limited to `.dockerignore`, `Dockerfile`, `requirements.txt`, `prefs.py`,
+`STAGE_1_WEB.txt`, the five `app/` modules, `static/style.css`, and the five
+templates documented in `CONTRACTS.md`.
 
 ## Required verification
 

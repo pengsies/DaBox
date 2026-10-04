@@ -3,7 +3,10 @@
 > **Unrestricted-root variant:** a successful player obtains real UID 0 on the
 > Ubuntu host. Use a disposable, single-player VM with no IAM role, reusable
 > credentials, sensitive data, or other workloads. Do not install this branch
-> on the shared Group 30 EC2. Read `UNRESTRICTED_ROOT_WARNING.md` first.
+> on a shared or persistent server. The assigned Group 30 EC2 is suitable only
+> while it is dedicated to this lab, has no valuable data or IAM role, and is
+> recreated after a player reaches root. Read `UNRESTRICTED_ROOT_WARNING.md`
+> first.
 
 This is the authoritative setup guide for the bounded-lifetime Flask release.
 The RelayForge host must be a native **Ubuntu Server 24.04.x LTS AMD64**
@@ -30,9 +33,9 @@ RelayForge-Responsibilities-Flask-v1.zip
 RelayForge-Responsibilities-Flask-v1.zip.sha256
 ```
 
-Do not distribute `responsibilities/diff/` or the raw teammate prototypes as
-deployment inputs. The release archive contains only the integrated
-`responsibilities/shared/` tree.
+Build and distribute the release from the authoritative DaBox repository root.
+Do not mix in an older extraction, teammate prototype, or historical
+comparison directory.
 
 ## 2. Create the Windows VM
 
@@ -234,6 +237,9 @@ python3 tests/supervisor_systemd_integration.py
 The Docker architecture must be `x86_64` or `amd64`; none of these commands
 should print `FAIL`. The systemd integration should run, not print the ARM-host
 skip message. The disposable suites remove their test containers and volumes.
+Membership in the `docker` group is host-root-equivalent; it is acceptable for
+the VM administrator during this disposable preflight, but never grant it to a
+player or service identity and remove it when it is no longer needed.
 Run this endpoint preflight before the full installation because the installed
 `relay-backend.service` later owns loopback port 19001. Do not install Docker
 from Snap, use rootless Docker, enable user-namespace remapping, or pre-create a
@@ -300,6 +306,23 @@ database passwords, an Ed25519 signing key, a Flask secret and a self-signed
 TLS certificate, pulls/builds the five containers, installs the systemd units,
 applies the firewall/SSH policy, starts the stack, and runs host verification.
 
+It also reconciles the RelayForge-owned installed footprint from explicit
+allowlists. `/opt/relayforge/app` receives only Compose and the build inputs
+used by nginx, Control, PostgreSQL, and Web; repository tests, attack helpers,
+and READMEs stay in the release tree. `/opt/relayforge/runtime` contains the
+four Python host programs and five supported lifecycle scripts, while
+`/opt/relayforge/bin` contains only `relay-worker`. The installer removes the
+exact obsolete `relay-cleanup.{service,timer}`, `relay-rotate.{service,timer}`,
+and permanent `relay-worker.service` units. It also removes the one recognized
+bounded-root Supervisor override after moving its useful runtime-directory
+preservation into the canonical unit. Any other Supervisor drop-in causes a
+fail-closed stop. The canonical service explicitly resets its capability
+bounding set to the full kernel set. It does not delete home files,
+arbitrary `/tmp` entries, foreign containers, images or volumes, OS/AWS
+services, secrets, flags, active transient Worker state, or the PostgreSQL
+volume. Here, “essentials only” means this bounded RelayForge footprint—not
+stripping a normal Ubuntu installation.
+
 The installer also copies the version-controlled
 `config/60-relayforge-sysctl.conf` to
 `/etc/sysctl.d/60-relayforge.conf`. Make lasting sysctl changes in the project
@@ -310,9 +333,16 @@ RelayForge expects these runtime ownership boundaries:
 ```text
 /etc/relayforge/job-signing.pub       root:root            0444
 /var/lib/relayforge/workers           root:root            0711
+/var/lib/relayforge/stages            root:root            0711
+/var/lib/relayforge/stages/STAGE_2_WORKER.txt root:relayforge-ipc 0440
+/var/lib/relayforge/stages/STAGE_3_ROOT.txt   root:root           0400
 /var/lib/relayforge/flag/root.txt     root:root            0600
 /run/relayforge/supervisor.sock       root:relayforge-ipc  0660
 ```
+
+The Web image separately contains `/opt/relayforge/web/STAGE_1_WEB.txt` as
+`root:root` mode `0444`. See `STAGE_MARKERS.md`; these are explanatory markers,
+while `root.txt` is the generated secret.
 
 Supervisor dynamically recreates the socket and repairs the Worker-state
 parent. The main `/etc/ssh/sshd_config` may safely be root-owned mode `0600` or
@@ -327,9 +357,10 @@ disposable VM when changing the endpoint.
 ### Updating an existing installation
 
 Use the same recorded player CIDR, public interface, administrator, and endpoint
-values. Cancel active connections through the portal or wait for their bounded
-lifetime to expire, confirm no Worker is running, and then rerun the installer
-from a newly verified and newly extracted release:
+values, then rerun the installer from a newly verified and newly extracted
+release. Active transient Workers and state are preserved; they retain their
+old executable mapping until cancellation or expiry, so use a new request to
+test the updated Worker:
 
 ```bash
 sudo systemctl list-units --state=running --type=service 'relay-worker-*'
@@ -343,7 +374,7 @@ sudo ./scripts/install.sh \
 sudo strings /opt/relayforge/bin/relay-worker | grep -E 'HTTP/1\.1|/relay/'
 ```
 
-Both Worker markers must be present. A Worker that was already running when the
+Both Worker protocol strings must be present. A Worker that was already running when the
 binary was replaced retains its old loaded executable; create a new portal
 request after the update.
 
@@ -365,12 +396,19 @@ sudo systemctl is-active docker.service relay-backend.service \
   relay-supervisor.service relayforge-firewall.service relayforge-stack.service
 sudo docker compose --project-directory /opt/relayforge/app \
   --env-file /etc/relayforge/compose.env ps
-curl --fail http://127.0.0.1:19001/health
-curl --fail --insecure https://127.0.0.1/healthz
+python3 - <<'PY'
+import ssl, urllib.request
+assert urllib.request.urlopen("http://127.0.0.1:19001/health", timeout=5).read() == b"ok\n"
+context = ssl._create_unverified_context()
+assert urllib.request.urlopen("https://127.0.0.1/healthz", context=context, timeout=5).read() == b"ok\n"
+print("PASS: private endpoint and HTTPS edge are healthy")
+PY
 ```
 
-Acceptance requires zero deployment-verification failures, five healthy containers, all
-listed host services active, and both health requests succeeding.
+Acceptance requires zero deployment-verification failures, five healthy
+containers, all listed host services active, and both health requests
+succeeding. Verification also checks the Stage 1/2/3 marker boundaries, exact
+managed runtime trees, and absence of the five legacy units.
 
 For a host-local functional run, use:
 
@@ -474,11 +512,11 @@ The release is fully accepted only when all of these are true:
 - **A service fails:** collect `sudo systemctl status <unit>` and
   `sudo journalctl -u <unit> -n 200 --no-pager` before resetting the VM.
 
-## 13. Optional housekeeping
+## 13. Optional footprint audit and bounded housekeeping
 
-No periodic cleanup is required. Supervisor normally reaps expired Worker
-state, Compose starts with `--remove-orphans`, and old images are harmless while
-disk space remains adequate.
+The installer removes unsupported files from its three managed `/opt` trees
+and the exact legacy units. Supervisor reaps valid expired Worker state, and
+Compose starts with `--remove-orphans`. Inspect before any further cleanup:
 
 Inspect before removing anything:
 
@@ -498,10 +536,13 @@ status is safe and cosmetic:
 sudo systemctl reset-failed 'relay-worker-*.service'
 ```
 
-Old, positively identified `/tmp/relayforge-*` extraction/build directories may
-be removed after the verified ZIP and checksum are retained. Do not manually
-remove `/opt/relayforge`, `/etc/relayforge`, `/var/lib/relayforge`, or any
-RelayForge Docker volume. Do not use `docker system prune -a --volumes`,
+Old, positively identified extraction/build directories may be removed one at
+a time after the verified ZIP and checksum are retained. The installer does
+not use broad `/tmp` globs or erase administrator home files, and it does not
+infer that an unlabelled container, image, volume, AWS agent, or Ubuntu package
+is disposable. Do not manually remove `/opt/relayforge`, `/etc/relayforge`,
+`/var/lib/relayforge`, or any RelayForge Docker volume. Do not use broad
+`apt autoremove`/package purges, `docker system prune -a --volumes`,
 `docker volume prune`, or `docker compose down --volumes` as housekeeping.
 
 `sudo /opt/relayforge/runtime/reset-lab.sh --yes` is a destructive challenge

@@ -447,7 +447,7 @@ class Supervisor:
             "--property=TimeoutStopSec=3s",
             f"--property=RuntimeMaxSec={max(1, int(active.deadline - time.time()))}s",
             f"--property=ReadWritePaths={work_dir}",
-            "--property=InaccessiblePaths=/etc/relayforge/secrets /var/lib/relayforge/flag -/var/run/docker.sock",
+            "--property=InaccessiblePaths=/etc/relayforge/secrets /var/lib/relayforge/flag /var/lib/relayforge/stages/STAGE_3_ROOT.txt -/var/run/docker.sock",
             "--property=SocketBindDeny=any",
             "--property=SocketBindAllow=tcp:25000-25099",
             os.fspath(WORKER_PATH),

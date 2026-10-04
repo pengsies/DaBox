@@ -1,9 +1,9 @@
-# Supervisor contribution and integration
+# Supervisor integration
 
 ## Status
 
-The Supervisor teammate's prototype contributed four important design elements
-to the integrated RelayForge path:
+The authoritative Supervisor implements four design elements required by the
+integrated RelayForge path:
 
 - kernel-verified Unix-socket peer credentials;
 - Ed25519 verification of Access-created jobs;
@@ -11,22 +11,18 @@ to the integrated RelayForge path:
 - the intentionally vulnerable diagnostic pathname re-execution used by the
   final host-root race.
 
-Those ideas are retained in the deployable Supervisor mirrored in this folder.
-The standalone C Supervisor, replacement Worker, rotation timers, and manual
-commands from the prototype notes are not deployment inputs. They used wire
-formats, state files, identities, and security boundaries that differ from the
-agreed cross-team contract.
+This directory is authoritative for the bounded-lifetime, unrestricted-root
+Flask challenge. A standalone C Supervisor, permanent Worker, rotation timers,
+or alternate manual wire protocol is not a deployment input.
 
-This shared version is authoritative for the bounded-lifetime,
-unrestricted-root Flask variant. The parent lab has intentionally diverged to
-rotating Worker generations.
+## Authoritative files
 
-## Integrated files
-
-| Shared mirror | Purpose |
+| File | Purpose |
 |---|---|
 | `host/supervisor.py` | Signed-job broker, transient-Worker lifecycle, active-cgroup diagnostic gate, and intentional root-exec TOCTOU. |
 | `host/relay-supervisor.service` | Deliberately unrestricted root broker and runtime socket directory for this dangerous challenge variant. |
+| `host/STAGE_2_WORKER.txt` | Read-only breadcrumb for the compromised host `relay` Worker. |
+| `host/STAGE_3_ROOT.txt` | Root-only breadcrumb proving the final host privilege domain. |
 | `tests/test_supervisor.py` | Component coverage for canonical jobs, signatures, exact Worker configuration, diagnostic gates, and the race primitive. |
 | `tests/test_systemd_units.sh` | Ubuntu systemd validation for the integrated units. |
 | `tests/supervisor_systemd_integration.py` | Real signed Supervisor to transient Worker, tunnel, Worker exploit, cgroup gate, and root diagnostic-race test. |
@@ -56,12 +52,57 @@ rotating Worker generations.
   pathname again as unrestricted host root with the socket as standard I/O.
 - The Supervisor is intentionally not systemd-sandboxed in this variant. This
   is the selected final-stage behavior, not a production recommendation.
+  `CapabilityBoundingSet=~` resets its bounding set to every capability the
+  host kernel supports, and verification checks the live process's permitted,
+  effective, and bounding masks rather than trusting the unit text alone.
+- `RuntimeDirectoryPreserve=yes` keeps the Supervisor socket directory's inode
+  stable across restarts for the Dispatcher's read-only bind mount.
+- Stage 2 is installed `root:relayforge-ipc` mode `0440`; Stage 3 is
+  `root:root` mode `0400`. Neither marker is a scoring secret.
 
-See `../CONTRACTS.md` for the complete shared contract.
+Because `relay` and host `relay-dispatch` both use `relayforge-ipc` as their
+primary group, either host identity can technically read Stage 2. In the
+deployed topology Dispatcher runs inside a container and the host marker
+directory is not mounted there. Stage 2 is therefore a learning breadcrumb,
+not an authorization mechanism. Stage 3 and the scoring flag remain host
+root-only; container UID 0 is not equivalent to this host-root stage.
+
+See `../CONTRACTS.md` for the complete integration contract.
+
+## Installed host footprint and upgrade cleanup
+
+The exact `/opt/relayforge/runtime` allowlist is:
+
+```text
+backend.py
+cleanup_state.py
+configure-firewall.sh
+firewall.py
+harden-ssh.sh
+init-challenge.sh
+reset-lab.sh
+supervisor.py
+verify-hardening.sh
+```
+
+`/opt/relayforge/bin` contains only `relay-worker`. The systemd unit files are
+installed under `/etc/systemd/system`; source documentation, tests, and attack
+helpers are not copied to the runtime tree.
+
+During upgrade, `install.sh` removes only the five exact obsolete units
+`relay-cleanup.service`, `relay-cleanup.timer`, `relay-rotate.service`,
+`relay-rotate.timer`, and permanent `relay-worker.service`. It deliberately
+does not wildcard-match current transient `relay-worker-<UUID>.service` units.
+The exact historical bounded-root `relay-supervisor.service.d/override.conf`
+is also removed; unknown or additional drop-ins fail closed.
+Delete-on-reconcile is scoped to the root-owned
+`/opt/relayforge/{app,runtime,bin}` directories. Generated secrets, database
+volumes, Worker/challenge state, unrelated containers, images, packages, home
+files, and `/tmp` contents are not broadly pruned.
 
 ## Verification sequence
 
-Run from `responsibilities/shared`:
+Run from the repository root:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 tests/test_supervisor.py
@@ -87,6 +128,5 @@ key-only SSH is not source-filtered by the guest firewall. Keep the logical
 service name `echo` unless every DB, Web, Access, Supervisor, and test owner
 coordinates the rename.
 
-Read `../UNRESTRICTED_ROOT_WARNING.md` before deployment. Never install this
-variant in place on the shared bounded-disclosure EC2; use a disposable,
+Read `../UNRESTRICTED_ROOT_WARNING.md` before deployment. Use a disposable,
 single-player machine with no cloud role or valuable data.

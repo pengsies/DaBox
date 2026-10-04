@@ -250,9 +250,20 @@ def main() -> int:
         identity, identity_rc = chain._shell_capture(client, "id", 8)
         if identity_rc != 0 or chain.RELAY_ID_RE.search(identity) is None:
             raise RuntimeError(f"real Worker shell identity is wrong: {identity}")
-        direct, direct_rc = chain._shell_capture(client, f"cat {chain.ROOT_FLAG_PATH} 2>&1", 8)
-        if direct_rc == 0 or chain.FLAG_RE.search(direct):
-            raise RuntimeError("relay shell directly read the root flag")
+        stage_two, stage_two_rc = chain._shell_capture(
+            client, f"cat {chain.WORKER_STAGE_PATH}", 8
+        )
+        if stage_two_rc != 0 or "RELAYFORGE_STAGE=2_HOST_RELAY_WORKER" not in stage_two:
+            raise RuntimeError("relay shell could not read the Worker stage marker")
+        direct, direct_rc = chain._shell_capture(
+            client, f"cat {chain.ROOT_STAGE_PATH} {chain.ROOT_FLAG_PATH} 2>&1", 8
+        )
+        if (
+            direct_rc == 0
+            or "RELAYFORGE_STAGE=3_UNRESTRICTED_HOST_ROOT" in direct
+            or chain.FLAG_RE.search(direct)
+        ):
+            raise RuntimeError("relay shell directly read a root-only marker or flag")
 
         race_source = (ROOT / "attacks/exploit_supervisor_race.py").read_bytes()
         encoded = base64.b64encode(race_source).decode("ascii")
@@ -266,7 +277,12 @@ def main() -> int:
             raise RuntimeError("could not transfer race helper into real Worker")
         race_output, race_rc = chain._shell_capture(client, f"python3 {remote} {job_id}", 20)
         flag = chain.FLAG_RE.search(race_output)
-        if race_rc != 0 or "ROOT_UID=0" not in race_output or flag is None:
+        if (
+            race_rc != 0
+            or "ROOT_UID=0" not in race_output
+            or "ROOT_STAGE=3_UNRESTRICTED_HOST_ROOT" not in race_output
+            or flag is None
+        ):
             raise RuntimeError(f"real Supervisor race failed: rc={race_rc}, output={race_output}")
         if flag.group(0) != "RF{fedcba98765432100123456789abcdef}":
             raise RuntimeError("Supervisor race returned unexpected data")
@@ -282,8 +298,8 @@ def main() -> int:
             client.close()
         docker("rm", "--force", name, check=False)
     print(
-        "PASS: real Worker relay shell cannot read the flag; unauthorized peers fail; "
-        "diagnostic TOCTOU executes as UID 0 and reads the root flag"
+        "PASS: stage markers enforce Web/relay/root boundaries; unauthorized peers fail; "
+        "diagnostic TOCTOU executes as UID 0 and reads the root marker plus flag"
     )
     return 0
 

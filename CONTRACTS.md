@@ -1,9 +1,8 @@
 # Cross-Team Contracts
 
 This document is the interface specification for the integrated Flask Web,
-Access Controller, Dispatcher, Supervisor, and Worker. A teammate may
-implement an internal component differently, but these observable contracts must remain
-consistent.
+Access Controller, Dispatcher, Supervisor, and Worker. Internal implementations
+may change, but these observable contracts must remain consistent.
 
 ## 0. HTTPS and Flask Web
 
@@ -345,7 +344,7 @@ The standard public-play deployment uses `PLAYER_CIDR=0.0.0.0/0`. A private
 event may replace it with one canonical organisation or VPN CIDR. This setting
 does not publish PostgreSQL, Flask's internal listener, or the private endpoint.
 
-## 9. Current shared decisions
+## 9. Current deployment decisions
 
 - One endpoint IPv4/port is supported per deployment.
 - The command protocol provides a raw TCP tunnel; the same listener also
@@ -355,6 +354,89 @@ does not publish PostgreSQL, Flask's internal listener, or the private endpoint.
 - Access owns the private signing key; Supervisor receives only the public key.
 - Worker has no DB credentials and runs as the unprivileged `relay` identity.
 - Each Worker has one finite requested lifetime of 30–420 seconds. It does not
-  use the parent lab's seven-minute `Restart=always` generation rotation.
+  use periodic generation rotation or `Restart=always`.
 - The authenticated request owner may cancel early through Flask; Dispatcher
   and Supervisor perform the actual confirmed unit stop.
+
+## 10. Access-stage marker contract
+
+Markers are observability aids and do not authorize an operation:
+
+```text
+/opt/relayforge/web/STAGE_1_WEB.txt                root:root            0444
+/var/lib/relayforge/stages                         root:root            0711
+/var/lib/relayforge/stages/STAGE_2_WORKER.txt      root:relayforge-ipc  0440
+/var/lib/relayforge/stages/STAGE_3_ROOT.txt        root:root            0400
+```
+
+The host marker directory is never mounted into a container. The native Worker
+may read Stage 2 but must fail to read Stage 3 and the generated root flag.
+Stage 3 is read only through proven UID-0 execution. These committed files are
+not secrets; `/var/lib/relayforge/flag/root.txt` remains the generated scoring
+secret and is `root:root` mode `0600`.
+
+Stage 2 is intentionally group-readable. Both host `relay` and host
+`relay-dispatch` have `relayforge-ipc` as their primary group, although the
+deployed Dispatcher process runs in a container where the stage directory is
+not mounted. The marker is an observation aid, not an authorization boundary.
+
+There is no database-stage marker. Database access demonstrates only the
+documented RPC capability. Likewise, UID 0 inside a container is not Stage 3:
+Stage 3 means UID 0 in the Ubuntu host namespace, with the host filesystem and
+Supervisor privilege domain.
+
+## 11. Installed-file and upgrade-cleanup contract
+
+`install.sh` builds the deployed host from explicit allowlists. The complete
+`/opt/relayforge/app` input set is:
+
+```text
+compose.yaml
+config/nginx.conf
+control/{Dockerfile,requirements.txt,common.py,policy.py,access.py,dispatcher.py,healthcheck.py}
+db/init/{001-init.sh,002-schema.sql.in}
+web/{.dockerignore,Dockerfile,requirements.txt,prefs.py,STAGE_1_WEB.txt}
+web/app/{__init__.py,auth.py,config.py,db.py,raw_rpc.py}
+web/static/style.css
+web/templates/{base.html,connection.html,cookie_policy.html,dashboard.html,login.html}
+```
+
+The complete host program sets are:
+
+```text
+/opt/relayforge/runtime/{backend.py,cleanup_state.py,configure-firewall.sh,
+  firewall.py,harden-ssh.sh,init-challenge.sh,reset-lab.sh,supervisor.py,
+  verify-hardening.sh}
+/opt/relayforge/bin/relay-worker
+```
+
+The installer uses delete-on-reconcile only inside those three root-owned,
+symlink-checked RelayForge trees. Thus repository-only material such as
+documentation, attack helpers, general tests, `web/tests/`, and `web/tools/`
+cannot become production runtime input.
+
+Upgrade cleanup removes only these exact legacy unit names:
+
+```text
+relay-cleanup.service
+relay-cleanup.timer
+relay-rotate.service
+relay-rotate.timer
+relay-worker.service
+```
+
+It also recognizes and removes one exact historical
+`relay-supervisor.service.d/override.conf`: the bounded-root prototype's
+runtime-directory settings plus five-capability `CapabilityBoundingSet`.
+`RuntimeDirectoryPreserve=yes` now lives in the canonical unit, while
+`CapabilityBoundingSet=~` deliberately restores the full kernel capability
+set required by this unrestricted-root variant. A different or additional
+Supervisor drop-in is unknown administrator state, so installation fails
+instead of deleting it.
+
+It does not match transient `relay-worker-<UUID>.service` units and does not run
+global Docker prune, volume removal, package purge/autoremove, or broad home and
+`/tmp` deletion. Generated files in `/etc/relayforge`, PostgreSQL volume data,
+and `/var/lib/relayforge` challenge state survive an ordinary reinstall. Only
+the separately invoked `reset-lab.sh --yes` intentionally destroys challenge
+state and rotates the flag.
