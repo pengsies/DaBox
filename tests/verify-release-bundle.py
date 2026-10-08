@@ -15,6 +15,8 @@ from pathlib import PurePosixPath
 REQUIRED = {
     ".env.example",
     "ATTACK_REPORT.md",
+    "BLIND_CTF_DISCOVERY.md",
+    "BLIND_CTF_MANUAL_COMMANDS.md",
     "PLAYER_ATTACK_GUIDE.md",
     "README.md",
     "CONTRACTS.md",

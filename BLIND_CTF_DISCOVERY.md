@@ -1,9 +1,14 @@
 # RelayForge blind-CTF discovery path
 
 > **Organizer-only spoilers:** Do not give this document, `PLAYER_ATTACK_GUIDE.md`,
-> `ATTACK_REPORT.md`, or the files under `attacks/` and `web/tools/` to players
-> during a blind event. This document explains how a fair player could derive
-> the intended solution and where RelayForge must provide an artifact or hint.
+> `BLIND_CTF_MANUAL_COMMANDS.md`, `ATTACK_REPORT.md`, or the files under
+> `attacks/` and `web/tools/` to players during a blind event. This document
+> explains how a fair player could derive the intended solution and where
+> RelayForge must provide an artifact or hint.
+
+For the exact commands that manually reproduce every stage without invoking a
+repository exploit helper, see `BLIND_CTF_MANUAL_COMMANDS.md`. It is a
+full-spoiler organizer/post-event walkthrough, not a participant handout.
 
 ## Purpose
 

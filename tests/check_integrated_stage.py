@@ -11,6 +11,8 @@ SHARED = Path(__file__).resolve().parents[1]
 REQUIRED = (
     ".env.example",
     "ATTACK_REPORT.md",
+    "BLIND_CTF_DISCOVERY.md",
+    "BLIND_CTF_MANUAL_COMMANDS.md",
     "PLAYER_ATTACK_GUIDE.md",
     "README.md",
     "CONTRACTS.md",
@@ -104,6 +106,7 @@ def main() -> int:
     schema = (SHARED / "db/init/002-schema.sql.in").read_text(encoding="utf-8")
     supervisor = (SHARED / "host/supervisor.py").read_text(encoding="utf-8")
     installer = (SHARED / "scripts/install.sh").read_text(encoding="utf-8")
+    manual_commands = (SHARED / "BLIND_CTF_MANUAL_COMMANDS.md").read_text(encoding="utf-8")
     if "max_duration BETWEEN 30 AND 420" not in schema or "duration BETWEEN 30 AND 420" not in schema:
         failures.append("bounded 30-420 second database contract changed")
     if "Restart=always" in supervisor or "WORKER_ROTATION_SECONDS" in supervisor:
@@ -113,6 +116,22 @@ def main() -> int:
     for expected in ("cancel_request", "claim_stop", "finish_stop"):
         if expected not in schema:
             failures.append(f"cancellation DB contract missing: {expected}")
+    for forbidden in (
+        "app.raw_rpc",
+        "attacks/full_chain.py",
+        "attacks/exploit_supervisor_race.py",
+        "web/tools/exploit_stage1.py",
+    ):
+        if forbidden in manual_commands:
+            failures.append(f"manual blind guide invokes a repository helper: {forbidden}")
+    for expected in (
+        "relay_web_api.submit_raw_request",
+        "OVERFLOW 136",
+        '"op":"diagnose"',
+        'os.replace("root.sh","diagnostic.sh")',
+    ):
+        if expected not in manual_commands:
+            failures.append(f"manual blind guide is missing a primitive: {expected}")
 
     if failures:
         for failure in failures:
