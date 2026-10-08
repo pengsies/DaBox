@@ -73,6 +73,7 @@ capabilities, and no-new-privileges policy.
 | `attacks/` | Flask pickle payload and complete intended-chain verifier |
 | `ATTACK_REPORT.md` | Flask-specific vulnerability chain, privilege boundaries, and current evidence status |
 | `PLAYER_ATTACK_GUIDE.md` | Full-spoiler beginner walkthrough from the supplied IP and credentials to the root flag |
+| `BLIND_CTF_DISCOVERY.md` | Organizer-only reasoning map, participant-artifact requirements, and staged hint ladder for a fair blind event |
 | `CONTRACTS.md` | Exact DB, signed-job, Unix-RPC, Worker, cancellation, and endpoint contracts |
 | `WEB_REQUIRED.md` | Implemented Flask-specific Web contract |
 | `SETUP.md` | Windows VM creation, Ubuntu Server installer choices, deployment, and acceptance |
@@ -186,9 +187,10 @@ real data or a privileged IAM role on this instance.
 ## Release archive
 
 This repository release is the **organizer/open-book bundle**. It contains the
-full-spoiler `PLAYER_ATTACK_GUIDE.md`, `ATTACK_REPORT.md`, and automated attack
-helpers. For a blind event, prepare a separate participant handout that omits
-those files; do not distribute this ZIP unchanged.
+full-spoiler `PLAYER_ATTACK_GUIDE.md`, `ATTACK_REPORT.md`,
+`BLIND_CTF_DISCOVERY.md`, and automated attack helpers. For a blind event,
+prepare a separate participant handout that omits those files; do not
+distribute this ZIP unchanged.
 
 Create a deterministic, secret-filtered ZIP in an existing output directory,
 then verify its contents and internal checksums:
