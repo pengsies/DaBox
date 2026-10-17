@@ -255,12 +255,60 @@ for service_user in relay relay-dispatch relay-backend; do
   done
 done
 
+staging=$(mktemp -d /tmp/relayforge-install.XXXXXX)
+build_dir=$(mktemp -d /tmp/relayforge-build.XXXXXX)
+trap 'rm -rf -- "$staging" "$build_dir"' EXIT
+
+# Build and validate the candidate before interrupting the running challenge.
+# If its bytes change, existing transient Workers would keep the old executable
+# mapping while Nginx published the new file, so wait for their bounded lifetime
+# (or cancel them during maintenance) rather than creating a mixed deployment.
+install -m 0644 "$project_dir/worker/relay-worker.c" "$project_dir/worker/Makefile" "$build_dir/"
+make -C "$build_dir" clean all
+readelf -h "$build_dir/relay-worker" | grep -Eq 'Type:[[:space:]]+DYN'
+readelf -lW "$build_dir/relay-worker" | grep -E 'GNU_STACK' | grep -qv 'RWE'
+readelf -lW "$build_dir/relay-worker" | grep -q 'GNU_RELRO'
+readelf -dW "$build_dir/relay-worker" | grep -q 'BIND_NOW'
+candidate_worker_sha256=$(sha256sum "$build_dir/relay-worker" | awk '{print $1}')
+if [[ ! $candidate_worker_sha256 =~ ^[0-9a-f]{64}$ ]]; then
+  echo "Unable to fingerprint the candidate Worker artifact." >&2
+  exit 1
+fi
+worker_binary_changes=1
+if [[ -f /opt/relayforge/bin/relay-worker && \
+      ! -L /opt/relayforge/bin/relay-worker ]] && \
+   cmp -s /opt/relayforge/bin/relay-worker "$build_dir/relay-worker"; then
+  worker_binary_changes=0
+fi
+if [[ $worker_binary_changes -eq 1 ]]; then
+  mapfile -t active_worker_units < <(
+    systemctl list-units --state=active --type=service --no-legend \
+      'relay-worker-*.service' | awk '{print $1}'
+  )
+  if [[ ${#active_worker_units[@]} -gt 0 ]]; then
+    echo "Refusing a binary-changing upgrade while transient Workers are active:" >&2
+    printf '  %s\n' "${active_worker_units[@]}" >&2
+    echo "Wait for their bounded lifetime or cancel them, then rerun the installer." >&2
+    exit 1
+  fi
+fi
+
 # Stop only the services whose on-disk programs/build contexts are about to be
-# reconciled.  Existing transient Workers are deliberately preserved: systemd
-# owns their running executables and the restarted Supervisor restores their
-# exact UUID state.
+# reconciled. Existing transient Workers are preserved only after the candidate
+# check above establishes that their executable bytes will not change; systemd
+# owns the running processes and the restarted Supervisor restores UUID state.
 systemctl stop relayforge-stack.service 2>/dev/null || true
 systemctl stop relay-supervisor.service relay-backend.service 2>/dev/null || true
+remaining_relayforge_containers=$(
+  docker ps --filter label=com.docker.compose.project=relayforge \
+    --format '{{.ID}} {{.Names}}'
+)
+if [[ -n $remaining_relayforge_containers ]]; then
+  echo "RelayForge containers remain after stopping relayforge-stack.service:" >&2
+  printf '%s\n' "$remaining_relayforge_containers" >&2
+  echo "Stop the manually managed project before rerunning the installer." >&2
+  exit 1
+fi
 
 # Remove exact units from the superseded timer/permanent-Worker prototypes.
 # No wildcard is used here, so current services and transient
@@ -340,9 +388,6 @@ install -o root -g relayforge-ipc -m 0440 "$project_dir/host/STAGE_2_WORKER.txt"
 install -o root -g root -m 0400 "$project_dir/host/STAGE_3_ROOT.txt" \
   /var/lib/relayforge/stages/STAGE_3_ROOT.txt
 
-staging=$(mktemp -d /tmp/relayforge-install.XXXXXX)
-build_dir=$(mktemp -d /tmp/relayforge-build.XXXXXX)
-trap 'rm -rf -- "$staging" "$build_dir"' EXIT
 app_stage=$staging/app
 runtime_stage=$staging/runtime
 bin_stage=$staging/bin
@@ -388,14 +433,17 @@ for runtime_script in init-challenge.sh configure-firewall.sh harden-ssh.sh rese
 done
 rsync -a --delete --chown=root:root "$runtime_stage/" /opt/relayforge/runtime/
 
-install -m 0644 "$project_dir/worker/relay-worker.c" "$project_dir/worker/Makefile" "$build_dir/"
-make -C "$build_dir" clean all
 install -m 0755 "$build_dir/relay-worker" "$bin_stage/relay-worker"
 rsync -a --delete --chown=root:root "$bin_stage/" /opt/relayforge/bin/
 readelf -h /opt/relayforge/bin/relay-worker | grep -Eq 'Type:[[:space:]]+DYN'
 readelf -lW /opt/relayforge/bin/relay-worker | grep -E 'GNU_STACK' | grep -qv 'RWE'
 readelf -lW /opt/relayforge/bin/relay-worker | grep -q 'GNU_RELRO'
 readelf -dW /opt/relayforge/bin/relay-worker | grep -q 'BIND_NOW'
+worker_artifact_sha256=$(sha256sum /opt/relayforge/bin/relay-worker | awk '{print $1}')
+if [[ $worker_artifact_sha256 != "$candidate_worker_sha256" ]]; then
+  echo "Installed Worker artifact differs from the validated candidate." >&2
+  exit 1
+fi
 
 for unit in relay-supervisor.service relay-backend.service relayforge-firewall.service relayforge-stack.service; do
   install -o root -g root -m 0644 "$project_dir/host/$unit" "/etc/systemd/system/$unit"
@@ -533,6 +581,7 @@ fi
   --env-file "$compose_environment" pull edge postgres
 /usr/bin/docker compose --project-directory /opt/relayforge/app \
   --env-file "$compose_environment" build --pull
+printf 'Installed Worker artifact SHA-256: %s\n' "$worker_artifact_sha256"
 
 if [[ $defer_firewall -eq 1 ]]; then
   systemctl disable --now relayforge-stack.service relayforge-firewall.service \
@@ -547,6 +596,12 @@ systemctl enable relay-backend.service relay-supervisor.service \
 systemctl restart relay-backend.service relay-supervisor.service
 systemctl restart relayforge-firewall.service
 systemctl restart relayforge-stack.service
+# A file bind refers to an inode. Recreate edge explicitly so an edge container
+# left running outside systemd cannot keep serving a pre-upgrade Worker after
+# rsync atomically replaces the host pathname.
+/usr/bin/docker compose --project-directory /opt/relayforge/app \
+  --env-file "$compose_environment" up --detach --no-build --no-deps \
+  --force-recreate --wait --wait-timeout 120 edge
 /opt/relayforge/runtime/verify-hardening.sh
 apt-get clean
 echo "RelayForge unrestricted-root installation and deployment verification completed."

@@ -47,7 +47,8 @@ It preserves:
 - `/etc/relayforge` secrets, TLS material, endpoint settings, and signing key;
 - `/var/lib/relayforge` flag, stage markers, and transient Worker state;
 - the `relayforge_postgres_data` Docker volume;
-- active transient `relay-worker-<UUID>.service` units; and
+- active transient `relay-worker-<UUID>.service` units when the candidate
+  Worker bytes are unchanged; and
 - the current five-container Compose project.
 
 It refuses to proceed while a foreign container is running. It never runs
@@ -142,9 +143,11 @@ Stop if any running container is not labelled with Compose project
 the recorded database deployment. Resolve that ownership explicitly; do not
 delete an unknown workload.
 
-The installer preserves active Workers. A Worker already in memory continues
-using its old binary until cancellation or expiry, so acceptance must create a
-new request after the update.
+The installer preserves active Workers only when the validated candidate binary
+is byte-identical to the installed Worker. For a binary-changing upgrade it
+fails before stopping the challenge; wait for bounded expiry or cancel the
+active requests, then rerun. Acceptance must create a new request after the
+update.
 
 ## 4. Upload a freshly packaged release
 

@@ -113,7 +113,10 @@ home or `/tmp` files, or rotate existing secrets and the root flag. Existing
 `/etc/relayforge`, PostgreSQL volume data, and `/var/lib/relayforge` state are
 preserved unless the operator explicitly runs the destructive reset command.
 The installer refuses to proceed while an unrelated running container is
-present rather than interrupting it during Docker package reconciliation.
+present, or while a manually managed `relayforge` container remains after the
+stack service stops, rather than interrupting unknown runtime state. It also
+refuses a binary-changing upgrade while a transient Worker is active, avoiding
+a mismatch between running Worker bytes and the public analysis artifact.
 
 ## Quick verification
 

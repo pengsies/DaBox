@@ -35,7 +35,10 @@ UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 FLAG_RE = re.compile(r"RF\{[0-9a-f]{32}\}")
 WEB_ID_RE = re.compile(r"uid=65532(?:\([^)]*\))?")
 RELAY_ID_RE = re.compile(r"uid=\d+\(relay\)")
-ROOT_UID_PROOF_RE = re.compile(r"(?m)^ROOT_UID=0\r?$")
+# The interactive relay shell can render its ``$ `` prompt immediately before
+# the race helper's first output line.  Keep the proof strict while accepting
+# that one expected transport artefact.
+ROOT_UID_PROOF_RE = re.compile(r"(?m)^(?:\$ )?ROOT_UID=0\r?$")
 ROOT_STAGE_PROOF_RE = re.compile(r"(?m)^ROOT_STAGE=3_UNRESTRICTED_HOST_ROOT\r?$")
 ROOT_FLAG_PROOF_RE = re.compile(r"(?m)^ROOT_FLAG=(RF\{[0-9a-f]{32}\})\r?$")
 LEAK_RE = re.compile(r"worker_shell=(0x[0-9a-fA-F]+)\Z")

@@ -9,6 +9,13 @@ may change, but these observable contracts must remain consistent.
 nginx is the only public container listener and publishes HTTPS 443. Flask is
 reachable only on the internal Compose network as `web:8080`.
 
+`GET /artifacts/relay-worker` returns the exact installed AMD64 Worker binary
+used for newly launched Workers through a read-only file mount in the Nginx
+container. A binary-changing upgrade is refused while a transient Worker is
+active, preventing old running bytes from diverging from the public artifact.
+This public artifact is for static analysis; it does not grant the Web
+container access to host files.
+
 Authenticated routes are `/dashboard`, `/cookie-policy`, `/connections[/<uuid>]`,
 `/connections/cancel`, `/api/request`, `/api/status[/<uuid>]`, `/api/cancel`,
 and `/api/result[/<name>]`. Mutations require the signed session and CSRF

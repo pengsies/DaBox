@@ -24,6 +24,317 @@ downloads packages and pulls/builds images.
 For recovery of the existing Group 30 EC2, including why each permission and
 service change is made, see `EC2_RECOVERY_AND_UPGRADE.md`.
 
+## How the Vulnerabilities Were Set Up
+
+This release is built as a staged vulnerability chain rather than a collection
+of unrelated shortcuts. Each stage gives the attacker one new capability and
+leaves the next boundary in place. The final stage is intentionally
+unrestricted Ubuntu-host UID 0, so the chain belongs only on a disposable,
+single-player machine. The following describes the implementation choices for
+organizers; it is not a player handout or a substitute for the installation
+steps below.
+
+### Stage 1: Authenticated Web Command Execution
+
+The Web foothold is created by combining two features that would each look
+plausible in isolation: the application issues a `remember_prefs` cookie by
+pickling a `RememberedPrefs` object, and a restricted unpickler later restores
+client-supplied pickle data. The allowlist in [web/prefs.py](web/prefs.py)
+includes `JobTemplate` and `JobRunner` as well as the ordinary preference
+class. `JobTemplate.__setstate__` queues its `command` field; a later
+`JobRunner.__setstate__` starts the queued text with `subprocess.Popen(...,
+shell=True)`. The authenticated dashboard invokes this restoration through
+[web/app/auth.py](web/app/auth.py).
+
+The process remains UID 65532 inside the read-only Web container. Its standard
+output and error are detached, so the application separately provides a
+bounded, authenticated, one-shot result mechanism for the exercise. That makes
+the foothold observable without giving the Web process a host shell. The flaw
+is the trust placed in serialized client-controlled state and the dangerous
+hooks on allowed classes, not the fact that the cookie is encoded or marked
+`HttpOnly`.
+
+The gadget is small, but its behavior depends on pickle restoring object state
+in sequence. In [web/prefs.py](web/prefs.py), the template queues state and the
+runner consumes it:
+
+```python
+class JobTemplate:
+  pending: list[str] = []
+
+  def __setstate__(self, state) -> None:
+    self.__dict__.update(state)
+    JobTemplate.pending.append(self.command)
+
+
+class JobRunner:
+  def __setstate__(self, state) -> None:
+    self.__dict__.update(state)
+    if JobTemplate.pending:
+      subprocess.Popen(
+        JobTemplate.pending.pop(),
+        shell=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+      )
+```
+
+The unpickler restricts global lookup to three named classes, but that is not
+enough: it permits the two classes whose state hooks form the gadget. The
+authenticated `remembered_username()` path in
+[web/app/auth.py](web/app/auth.py) decodes the browser-supplied base64 and
+passes the bytes to that unpickler. The dashboard calls this function during
+an authenticated page request. These are the two pieces that make the flaw
+reachable: an unsafe allowed object graph and a request path that reconstructs
+it.
+
+The detached child process explains the separate result-file/API mechanism
+described in the walkthrough. Output capture is a deliberate observability
+feature for the challenge; it does not run the command with more privilege.
+
+The normal login account is seeded for the lab, but its credentials are not
+revealed by the public login form. An IP-only exercise therefore needs an
+organizer-provided credential clue or a separately designed, bounded recovery
+step; the current login rate limit does not make arbitrary wordlist guessing a
+reliable discovery mechanism.
+
+### Stage 2: Narrow Database Pivot and Policy Differential
+
+The Web role is deliberately denied direct access to private database tables.
+The database instead exposes a narrow set of `SECURITY DEFINER` functions.
+Among these is `relay_web_api.submit_raw_request`, granted to `relay_web` in
+[db/init/002-schema.sql.in](db/init/002-schema.sql.in). The Web adapter in
+[web/app/db.py](web/app/db.py) calls it, but no public HTTP route does. This
+means the RPC becomes useful only after Web command execution reveals the
+adapter and the compromised process's existing database access. The result is
+permission to enqueue a request, not PostgreSQL superuser access, access to
+private job rows, or authority to sign or dispatch a job.
+
+The request options then create the cross-component parser differential.
+[control/policy.py](control/policy.py) validates the option grammar and
+authorizes using the first `profile` value, requiring it to be `safe`.
+Independently, the native Worker parser in
+[worker/relay-worker.c](worker/relay-worker.c) updates its selected profile as
+it processes each pair, so the last `profile` value controls Worker mode. Both
+components accept the same bounded raw string. With `safe` first and `legacy`
+last, Access approves the request while the Worker enters legacy mode. Reversing
+the order is the negative control and should be rejected by Access.
+
+The normal dashboard continues to call only the safe-request function and
+cannot submit caller-chosen raw options. Access still checks the user's grant,
+target state, service, duration, and parser result, then signs the bounded
+launch envelope. Dispatcher and Supervisor verify that signed envelope before
+launching anything. Those controls make the parser mismatch the intended pivot;
+they do not make the raw RPC a general job-launch or signing API.
+
+The database grants the extra RPC explicitly. Its definition is intentionally
+short and still routes through the normal bounded enqueue function:
+
+```sql
+-- relay_web can submit raw legacy options, but no public HTTP route exposes them.
+CREATE FUNCTION relay_web_api.submit_raw_request(
+    p_username text,
+    p_target text,
+    p_service text,
+    p_duration integer,
+    p_options_raw text
+) RETURNS uuid
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = pg_catalog, private, pg_temp
+AS $$
+  SELECT private.enqueue_request(
+    p_username, p_target, p_service, p_duration, p_options_raw
+  );
+$$;
+```
+
+Execution is granted to `relay_web` in the schema's final privilege section;
+direct table access remains revoked. In
+[web/app/db.py](web/app/db.py), the matching adapter calls the function with
+bound parameters and documents that no HTTP route invokes it:
+
+```python
+def submit_raw_request(username, target, service, duration, options_raw):
+    """Internal pivot available to a process that has compromised this container.
+
+    No HTTP route calls this deliberately retained raw-request RPC.
+    """
+    request_id = scalar(
+        "SELECT relay_web_api.submit_raw_request(%s, %s, %s, %s, %s) AS request_id",
+        (username, target, service, duration, options_raw),
+    )
+```
+
+The mismatch is visible when the two parsers are read side by side. Access
+returns the first value as its effective profile and requires it to be safe:
+
+```python
+@property
+def effective_profile(self) -> str:
+    return self.profiles[0]
+```
+
+The Worker parser instead updates `last_legacy` as it encounters each
+`profile` pair and selects the final value after parsing. Thus
+`profile=safe&note=manual&profile=legacy` passes Access's first-value check but
+selects legacy mode in the Worker. The deliberately useful bug is inconsistent
+duplicate-key semantics across a trust boundary, not an option that changes
+the signed endpoint or executes a command directly.
+
+### Stage 3: Transient Native Worker and Memory-Corruption Primitive
+
+The Worker is a host process, but it runs as the unprivileged `relay` account
+inside a transient systemd unit. The authorized status response provides its
+short-lived port and bearer token. A pre-request port scan is not expected to
+find a listener because the Worker does not exist until a signed request has
+been approved and dispatched.
+
+In [worker/relay-worker.c](worker/relay-worker.c), the legacy-mode command
+handler exposes two linked primitives. `LEAK` prints the live address of
+`worker_shell`, which is useful against PIE address randomization. `OVERFLOW`
+accepts a payload up to the size of `struct debug_frame`: a 128-byte data field
+followed by an eight-byte callback on AMD64. The bounded copy can overwrite the
+adjacent callback, which is then invoked. A payload that places the leaked
+`worker_shell` address in that field opens a shell as `relay`.
+
+The layout is made explicit and compile-time checked:
+
+```c
+struct debug_frame {
+  unsigned char data[128];
+  void (*next)(int);
+};
+
+_Static_assert(offsetof(struct debug_frame, next) == 128U,
+         "callback offset must stay stable");
+_Static_assert(sizeof(void *) == 8U, "RelayForge requires a 64-bit target");
+_Static_assert(sizeof(struct debug_frame) == 136U,
+         "unexpected debug frame padding");
+```
+
+The copy initializes the callback to a benign function, copies only the
+caller-supplied bounded length into the entire frame, then calls the callback
+now stored in the frame:
+
+```c
+static void vulnerable_debug(int fd, const unsigned char *payload, size_t length) {
+  volatile struct debug_frame frame;
+  frame.next = normal_action;
+  for (size_t index = 0U; index < length; index++) {
+    ((volatile unsigned char *)&frame)[index] = payload[index];
+  }
+  void (*next)(int) = frame.next;
+  next(fd);
+}
+```
+
+The command handler rejects a requested size greater than
+`sizeof(struct debug_frame)` before reading the payload. This keeps the bug
+bounded to adjacent fields and makes the offset a binary-analysis result that
+can be checked against the ELF. The `LEAK` output is likewise a deliberate
+legacy-only disclosure of `worker_shell`; a safe Worker returns a command
+error instead.
+
+The Worker is compiled with PIE, stack protection, NX, RELRO, and immediate
+binding in [worker/Makefile](worker/Makefile). These protections are retained
+as part of the exercise: the intended chain uses an address disclosure and
+redirects an existing callback rather than injecting code. The copy is capped
+at the exact frame size; this is a bounded adjacent-field overwrite, not an
+unlimited stack write. `CONNECT` remains the ordinary tunnel operation, and a
+safe-mode Worker rejects `LEAK` and `OVERFLOW`.
+
+### Stage 4: Root Supervisor Pathname TOCTOU
+
+The final vulnerability is placed in the host Supervisor's `diagnose`
+operation in [host/supervisor.py](host/supervisor.py). Before reaching the
+vulnerable sequence, the Supervisor requires the caller to be the `relay`
+process in the exact active Worker cgroup, checks that the job is live, and
+accepts only the expected diagnostic name and exact benign file metadata and
+contents. It opens the benign file without following symlinks and validates it
+through that descriptor.
+
+The intentional error is that the Supervisor closes the validated descriptor,
+sends a `validated` acknowledgement, waits for a short deterministic interval,
+and then executes the pathname again. The active Worker can atomically replace
+the pathname after the acknowledgement, so the file that root executes need
+not be the file root validated. The validation is careful about the original
+file, but the check and use are not tied to the same open object.
+
+The relevant implementation order in
+[host/supervisor.py](host/supervisor.py) is the vulnerability. The Supervisor
+opens without following symlinks, checks metadata and exact bytes using the
+descriptor, and closes it:
+
+```python
+descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+try:
+  checked = os.fstat(descriptor)
+  # Validate regular-file type, relay ownership, link count, mode, and size.
+  data = os.read(descriptor, len(DIAGNOSTIC_SCRIPT) + 1)
+finally:
+  os.close(descriptor)
+if data != DIAGNOSTIC_SCRIPT:
+  raise ProtocolError("diagnostic script content failed validation")
+
+connection.sendall(canonical_response({"ok": True, "state": "validated"}))
+time.sleep(DIAGNOSTIC_DELAY_SECONDS)
+process = subprocess.Popen([os.fspath(path)], ...)
+```
+
+The attacker-controlled Worker can replace `path` after the acknowledgement;
+the final `Popen` resolves the name again rather than executing the validated
+descriptor. The race is limited to the active job's exact work directory, job
+deadline, and authenticated local Supervisor protocol, but a successful
+replacement is still executed in the Supervisor's host privilege domain.
+
+The Supervisor service in
+[host/relay-supervisor.service](host/relay-supervisor.service) deliberately
+runs as root without a namespace, filesystem, or capability reduction. This
+is what makes successful pathname replacement yield unrestricted host UID 0,
+rather than a constrained helper or container-root result. It is also why the
+installer requires `--acknowledge-unrestricted-root`, the deployment must have
+no IAM role or other workload, and a solved instance must be destroyed and
+recreated rather than trusted after an in-place reset.
+
+The unit makes that impact explicit:
+
+```ini
+[Service]
+User=root
+Group=relayforge-ipc
+CapabilityBoundingSet=~
+NoNewPrivileges=no
+PrivateDevices=no
+PrivateIPC=no
+PrivateTmp=no
+ProtectHome=no
+ProtectSystem=no
+RestrictNamespaces=no
+```
+
+This configuration is intentionally unsafe for a general-purpose host. It is
+part of the challenge construction, not a recommended Supervisor deployment.
+
+### Stage Markers and Validation
+
+The three stage files indicate the privilege boundary reached: Web UID 65532,
+host `relay`, and host UID 0. They are explanatory breadcrumbs, not scoring
+flags or proof by themselves. The generated scoring flag remains
+`/var/lib/relayforge/flag/root.txt`, readable only by root.
+
+The setup and verification scripts install the marker files with distinct
+ownership and modes, keep the Web container away from host stage files, and
+verify that `relay` can read Stage 2 but not Stage 3 or the flag. The source
+tests exercise the parser decisions, Worker protocol and frame assumptions,
+Supervisor gates, and pathname replacement. Local tests establish behavior of
+the checked-in implementation; only the deployment checks and an authorized
+external run establish that the target instance is configured as intended.
+The full root-chain acceptance test intentionally obtains host UID 0 and should
+be run only when the operator is prepared to destroy and recreate that VM.
+
 ## 1. Required files
 
 Distribute these two files together:
@@ -358,9 +669,10 @@ disposable VM when changing the endpoint.
 
 Use the same recorded player CIDR, public interface, administrator, and endpoint
 values, then rerun the installer from a newly verified and newly extracted
-release. Active transient Workers and state are preserved; they retain their
-old executable mapping until cancellation or expiry, so use a new request to
-test the updated Worker:
+release. If the candidate Worker bytes differ, the installer refuses to begin
+the upgrade while a transient Worker is active. Wait for its bounded expiry or
+cancel it during the maintenance window, then rerun. When the Worker bytes are
+unchanged, active transient Workers and state are preserved:
 
 ```bash
 sudo systemctl list-units --state=running --type=service 'relay-worker-*'
@@ -374,9 +686,10 @@ sudo ./scripts/install.sh \
 sudo strings /opt/relayforge/bin/relay-worker | grep -E 'HTTP/1\.1|/relay/'
 ```
 
-Both Worker protocol strings must be present. A Worker that was already running when the
-binary was replaced retains its old loaded executable; create a new portal
-request after the update.
+Both Worker protocol strings must be present. The installer prints the deployed
+Worker SHA-256, recreates the edge container, and the hardening verifier proves
+that the public download is byte-identical to the installed executable. Create
+a new portal request after the update for functional acceptance.
 
 To change a public deployment back to one trusted player network without
 reinstalling:

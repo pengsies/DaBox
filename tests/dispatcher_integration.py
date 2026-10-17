@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def command(secrets: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment["RF_TEST_SECRETS"] = str(secrets)
+    environment["RF_TEST_WORKER"] = str(secrets / "relay-worker")
     return subprocess.run(
         [
             "docker",

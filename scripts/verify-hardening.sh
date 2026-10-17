@@ -4,6 +4,11 @@ umask 077
 
 passes=0
 failures=0
+verification_scratch=$(mktemp -d /tmp/relayforge-verify.XXXXXX) || {
+  echo "Unable to create verification scratch directory." >&2
+  exit 1
+}
+trap 'rm -rf -- "$verification_scratch"' EXIT
 pass() { printf 'PASS  %s\n' "$1"; ((passes+=1)); }
 fail() { printf 'FAIL  %s\n' "$1" >&2; ((failures+=1)); }
 expect_command() {
@@ -100,6 +105,7 @@ expect_file /var/lib/relayforge/stages/STAGE_3_ROOT.txt root root 400 "root stag
 expect_command "root stage marker has canonical identity" grep -qx \
   'RELAYFORGE_STAGE=3_UNRESTRICTED_HOST_ROOT' \
   /var/lib/relayforge/stages/STAGE_3_ROOT.txt
+expect_directory /opt/relayforge/bin root root 755 "Worker binary directory is root-owned"
 expect_file /opt/relayforge/bin/relay-worker root root 755 "Worker executable is root-owned"
 expect_command "relay can read only its Worker stage marker" runuser -u relay -- \
   grep -qx 'RELAYFORGE_STAGE=2_HOST_RELAY_WORKER' \
@@ -293,6 +299,80 @@ if [[ $published == *'"443/tcp"'* && $published == *'"HostIp":"0.0.0.0"'* && \
   pass "only edge HTTPS is Docker-published"
 else
   fail "only edge HTTPS is Docker-published"
+fi
+
+edge_worker_mount=$(
+  docker inspect --format \
+    '{{range .Mounts}}{{if eq .Destination "/etc/nginx/artifacts/relay-worker"}}{{.Type}}|{{.Source}}|{{.Destination}}|{{.RW}}{{end}}{{end}}' \
+    "$edge_id" 2>/dev/null || true
+)
+if [[ $edge_worker_mount == 'bind|/opt/relayforge/bin/relay-worker|/etc/nginx/artifacts/relay-worker|false' ]]; then
+  pass "edge has the exact read-only Worker artifact mount"
+else
+  fail "edge has the exact read-only Worker artifact mount ($edge_worker_mount)"
+fi
+
+worker_artifact_probe=$verification_scratch/relay-worker
+if /usr/bin/python3 - "$worker_artifact_probe" <<'PY'
+import pathlib
+import ssl
+import sys
+import urllib.request
+
+destination = pathlib.Path(sys.argv[1])
+context = ssl.create_default_context()
+context.check_hostname = False
+context.verify_mode = ssl.CERT_NONE
+
+
+def fetch(path: str):
+    request = urllib.request.Request(
+        f"https://127.0.0.1{path}",
+        headers={"User-Agent": "RelayForge deployment verifier"},
+    )
+    return urllib.request.urlopen(request, context=context, timeout=10)
+
+
+with fetch("/robots.txt") as response:
+    if response.status != 200:
+        raise SystemExit(f"robots.txt returned HTTP {response.status}")
+    robots = response.read(4097)
+    if len(robots) > 4096 or b"Allow: /artifacts/relay-worker" not in robots:
+        raise SystemExit("robots.txt does not advertise the Worker artifact")
+
+with fetch("/artifacts/relay-worker") as response:
+    if response.status != 200:
+        raise SystemExit(f"Worker artifact returned HTTP {response.status}")
+    if response.headers.get_content_type() != "application/octet-stream":
+        raise SystemExit("Worker artifact has the wrong content type")
+    if 'filename="relay-worker"' not in response.headers.get("Content-Disposition", ""):
+        raise SystemExit("Worker artifact has the wrong download filename")
+    if response.headers.get("Cache-Control") != "no-store":
+        raise SystemExit("Worker artifact is not marked no-store")
+    if response.headers.get("X-Content-Type-Options") != "nosniff":
+        raise SystemExit("Worker artifact is missing nosniff")
+    artifact = response.read(32 * 1024 * 1024 + 1)
+    if len(artifact) > 32 * 1024 * 1024:
+        raise SystemExit("Worker artifact exceeds the deployment size limit")
+    destination.write_bytes(artifact)
+PY
+then
+  host_worker_sha256=$(sha256sum /opt/relayforge/bin/relay-worker | awk '{print $1}')
+  edge_worker_sha256=$(
+    docker exec "$edge_id" sha256sum /etc/nginx/artifacts/relay-worker 2>/dev/null |
+      awk '{print $1}'
+  )
+  downloaded_worker_sha256=$(sha256sum "$worker_artifact_probe" | awk '{print $1}')
+  if cmp -s /opt/relayforge/bin/relay-worker "$worker_artifact_probe" && \
+     [[ $host_worker_sha256 =~ ^[0-9a-f]{64}$ && \
+        $host_worker_sha256 == "$edge_worker_sha256" && \
+        $host_worker_sha256 == "$downloaded_worker_sha256" ]]; then
+    pass "public Worker artifact is byte-identical to the deployed executable ($host_worker_sha256)"
+  else
+    fail "public Worker artifact differs from the deployed executable ($host_worker_sha256/$edge_worker_sha256/$downloaded_worker_sha256)"
+  fi
+else
+  fail "public Worker artifact and discovery route are reachable with canonical headers"
 fi
 
 db=("${compose[@]}" exec -T postgres psql -v ON_ERROR_STOP=1 -U postgres -d relayforge)

@@ -95,12 +95,13 @@ class Audit:
         }
         for relative, first_line in expected.items():
             content = self.read(relative)
+            lines = content.splitlines()
             self.require(
-                content.splitlines()[:1] == [first_line]
-                and "\nACCESS\n" in content
-                and "\nNEXT\n" in content
+                len(lines) == 2
+                and lines[0] == first_line
+                and bool(lines[1].strip())
                 and "RF{" not in content,
-                f"stage breadcrumb contract changed: {relative}",
+                f"stage marker content changed: {relative}",
             )
 
     def web(self) -> None:
@@ -173,9 +174,21 @@ class Audit:
             and "return 404" in nginx,
             "edge does not reject hidden/legacy paths",
         )
+        self.require(
+            "location = /artifacts/relay-worker" in nginx
+            and "alias /etc/nginx/artifacts/relay-worker;" in nginx
+            and nginx.count("add_header X-Content-Type-Options nosniff always;") == 2,
+            "exact Worker artifact download route is missing",
+        )
+        self.require(
+            "location = /robots.txt" in nginx
+            and "Allow: /artifacts/relay-worker" in nginx,
+            "robots.txt does not advertise the Worker artifact route",
+        )
 
     def compose(self) -> None:
         compose = self.read("compose.yaml")
+        integration = self.read("tests/compose.integration.yaml")
         dockerfiles = self.read("web/Dockerfile") + self.read("control/Dockerfile")
         combined = compose + dockerfiles
         digests = re.findall(r"sha256:[0-9a-f]{64}", combined)
@@ -185,6 +198,20 @@ class Audit:
         )
         self.require(compose.count("ports:") == 1, "more than one Compose service publishes ports")
         self.require('"0.0.0.0:443:443"' in compose, "edge HTTPS publication is missing")
+        self.require(
+            "source: /opt/relayforge/bin/relay-worker" in compose
+            and "target: /etc/nginx/artifacts/relay-worker" in compose
+            and "read_only: true" in compose
+            and "create_host_path: false" in compose,
+            "edge does not have the exact read-only Worker artifact mount",
+        )
+        self.require(
+            "volumes: !override" in integration
+            and "RF_TEST_WORKER" in integration
+            and "target: /etc/nginx/artifacts/relay-worker" in integration
+            and "./config/nginx.conf:/etc/nginx/nginx.conf:ro" in integration,
+            "container integration does not replace all edge artifact fixtures",
+        )
         for forbidden in ("docker.sock", "privileged:", "network_mode: host", "pid: host"):
             self.require(forbidden not in compose, f"forbidden Compose escape surface: {forbidden}")
         self.require(
@@ -251,6 +278,7 @@ class Audit:
         access = self.read("control/access.py")
         supervisor = self.read("host/supervisor.py")
         supervisor_unit = self.read("host/relay-supervisor.service")
+        stack_unit = self.read("host/relayforge-stack.service")
         worker = self.read("worker/relay-worker.c")
         makefile = self.read("worker/Makefile")
         firewall = self.read("host/firewall.py")
@@ -424,6 +452,19 @@ class Audit:
             "installer does not reconcile the managed runtime/bin allowlists",
         )
         self.require(
+            'worker_artifact_sha256=$(sha256sum /opt/relayforge/bin/relay-worker' in install
+            and "candidate_worker_sha256" in install
+            and "active_worker_units" in install
+            and "Refusing a binary-changing upgrade" in install
+            and install.index('make -C "$build_dir" clean all')
+            < install.rindex("systemctl stop relayforge-stack.service")
+            and "--force-recreate --wait --wait-timeout 120 edge" in install
+            and 'fetch("/robots.txt")' in verifier
+            and 'fetch("/artifacts/relay-worker")' in verifier
+            and 'cmp -s /opt/relayforge/bin/relay-worker "$worker_artifact_probe"' in verifier,
+            "installer does not verify the public Worker artifact against the deployed binary",
+        )
+        self.require(
             all(
                 name in install
                 for name in (
@@ -435,7 +476,8 @@ class Audit:
                 )
             )
             and 'rm -f -- "/etc/systemd/system/$legacy_unit"' in install
-            and "relay-worker-*.service" not in install,
+            and 'disable --now relay-worker-*' not in install
+            and 'rm -f -- "/etc/systemd/system/relay-worker-*' not in install,
             "installer legacy-unit cleanup is missing or over-broad",
         )
         self.require(
@@ -451,8 +493,14 @@ class Audit:
         self.require(
             "foreign_containers" in install
             and 'com.docker.compose.project' in install
-            and "non-RelayForge containers" in install,
+            and "non-RelayForge containers" in install
+            and "remaining_relayforge_containers" in install
+            and "Stop the manually managed project" in install,
             "installer can disrupt an unrelated running container",
+        )
+        self.require(
+            "ExecStartPre=/usr/bin/test -f /opt/relayforge/bin/relay-worker" in stack_unit,
+            "stack service does not fail closed when the Worker artifact is absent",
         )
         self.require(
             re.search(r"\bcurl\b", install) is None

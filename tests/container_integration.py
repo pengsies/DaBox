@@ -51,6 +51,7 @@ def run_compose(
 ) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment["RF_TEST_SECRETS"] = str(secrets)
+    environment["RF_TEST_WORKER"] = str(secrets / "relay-worker")
     return subprocess.run(
         [*compose_command(secrets), *arguments], cwd=ROOT, env=environment,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -98,6 +99,34 @@ def csrf_from(page: bytes) -> str:
     if matched is None:
         raise IntegrationError("page did not contain a CSRF token")
     return matched.group(1).decode("ascii")
+
+
+def verify_worker_artifact(client: urllib.request.OpenerDirector) -> None:
+    status, robots, _ = request(client, BASE + "/robots.txt")
+    if status != 200 or b"Allow: /artifacts/relay-worker" not in robots:
+        raise IntegrationError("robots.txt did not advertise the Worker artifact")
+
+    artifact_request = urllib.request.Request(BASE + "/artifacts/relay-worker")
+    with client.open(artifact_request, timeout=8) as response:
+        artifact = response.read()
+        if response.status != 200:
+            raise IntegrationError(
+                f"Worker artifact returned HTTP {response.status}"
+            )
+        if response.headers.get_content_type() != "application/octet-stream":
+            raise IntegrationError("Worker artifact content type changed")
+        if 'filename="relay-worker"' not in response.headers.get(
+            "Content-Disposition", ""
+        ):
+            raise IntegrationError("Worker artifact download filename changed")
+        if response.headers.get("Cache-Control") != "no-store":
+            raise IntegrationError("Worker artifact is not marked no-store")
+        if response.headers.get("X-Content-Type-Options") != "nosniff":
+            raise IntegrationError("Worker artifact is missing nosniff")
+
+    expected = (ROOT / "worker" / "relay-worker.c").read_bytes()
+    if artifact != expected:
+        raise IntegrationError("Worker artifact route changed the mounted bytes")
 
 
 def login(
@@ -307,6 +336,7 @@ def main() -> int:
         expected_endpoint = target_endpoint(args.secrets, "archive-echo")
 
         client, jar = opener()
+        verify_worker_artifact(client)
         csrf = login(client, jar)
 
         stage_one = exploit_command(

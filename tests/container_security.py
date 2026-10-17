@@ -35,6 +35,7 @@ EXPECTED_CAPS = {
 def compose(secrets: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment["RF_TEST_SECRETS"] = str(secrets)
+    environment["RF_TEST_WORKER"] = str(secrets / "relay-worker")
     return subprocess.run(
         [
             "docker",
@@ -111,6 +112,21 @@ def main() -> int:
                 expected = {"443/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8443"}]}
                 if ports != expected:
                     raise AssertionError(f"integration edge port binding changed: {ports}")
+                artifact_mounts = [
+                    mount for mount in data.get("Mounts", [])
+                    if mount.get("Destination") == "/etc/nginx/artifacts/relay-worker"
+                ]
+                if len(artifact_mounts) != 1:
+                    raise AssertionError("edge does not have exactly one Worker artifact mount")
+                artifact_mount = artifact_mounts[0]
+                if (
+                    artifact_mount.get("Source") != str(args.secrets / "relay-worker")
+                    or artifact_mount.get("RW") is not False
+                    or artifact_mount.get("Type") != "bind"
+                ):
+                    raise AssertionError(
+                        f"edge Worker artifact mount changed: {artifact_mount}"
+                    )
             elif ports:
                 raise AssertionError(f"{service} unexpectedly publishes a port: {ports}")
 

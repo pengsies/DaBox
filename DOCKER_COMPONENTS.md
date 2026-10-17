@@ -7,7 +7,7 @@ them on Ubuntu AMD64.
 
 | Service | Image source | Purpose | Public exposure |
 |---|---|---|---|
-| `edge` | Pinned `nginx:1.30.4-alpine3.24` image | TLS termination, limits, headers, and reverse proxy to Flask | Host TCP 443 |
+| `edge` | Pinned `nginx:1.30.4-alpine3.24` image | TLS termination, limits, headers, Flask proxy, and exact Worker artifact download | Host TCP 443 |
 | `web` | Built from `web/Dockerfile` on pinned `python:3.12.14-slim-bookworm` | Flask/Gunicorn login, dashboard, safe API, and intended authenticated pickle foothold | Internal TCP 8080 only |
 | `postgres` | Pinned `postgres:16.15-alpine3.23` image | Canonical users, targets, requests, jobs, state machine, and restricted RPC schemas | Internal TCP 5432 only |
 | `access` | Built from `control/Dockerfile` on pinned Python base | Policy evaluation and Ed25519 job signing | No published port |
@@ -15,6 +15,12 @@ them on Ubuntu AMD64.
 
 The SHA-256 image digests are authoritative in `compose.yaml` and the two
 Dockerfiles. Tags in this table are human-readable labels only.
+
+Nginx receives one read-only bind mount of
+`/opt/relayforge/bin/relay-worker` and publishes that exact file at
+`/artifacts/relay-worker` over HTTPS. This is the deliberate IP-only CTF
+acquisition path for static analysis; the Web container receives no host
+filesystem mount.
 
 ## Included Docker inputs
 
@@ -67,7 +73,7 @@ its final image.
 Only nginx publishes a Docker port. PostgreSQL and Flask are not bound to host
 ports. Dispatcher receives the host Supervisor socket as a read-only bind; the
 Access container receives only the signing private key it needs; nginx receives
-only the TLS directory.
+the TLS directory and the exact Worker executable as separate read-only binds.
 
 The Web image bakes in the read-only Stage 1 learning marker. The host-only
 `/var/lib/relayforge/stages` directory is not mounted into any container, so

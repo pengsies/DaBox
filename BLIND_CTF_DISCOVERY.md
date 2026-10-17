@@ -33,13 +33,13 @@ sanitized source is normal; it does not stop the challenge from being blind.
 The initial handout may contain:
 
 ```text
-Portal:   https://<TARGET>/login
-Username: <PLAYER-USERNAME>
-Password: <PLAYER-PASSWORD>
-Goal:     obtain host UID 0 and read the generated root flag
-Format:   RF{32-lowercase-hex-characters}
-Scope:    the assigned disposable RelayForge host only
+Target:   <EC2-IPv4>
 ```
+
+For the IP-only variant, the player brute-forces the public `/login` form
+using local wordlists. The exact deployed Worker binary is available from the
+same target at `https://<EC2-IPv4>/artifacts/relay-worker`; no separate player
+pack is handed out.
 
 It may also include an accurate topology and the public surface:
 
@@ -286,9 +286,10 @@ same signed options -> Access selects first/safe -> Worker selects last/legacy
 
 ### Fair artifact requirement
 
-Provide the exact production `relay-worker` AMD64 binary and its SHA-256. A
-native memory-corruption challenge normally supplies its binary. Do not expect
-players to infer command names, structure layout, or offsets from topology.
+Make the exact production `relay-worker` AMD64 binary downloadable at
+`https://<EC2-IPv4>/artifacts/relay-worker`. A native memory-corruption
+challenge normally exposes its binary. Do not expect players to infer command
+names, structure layout, or offsets from topology.
 
 Nothing in the topology determines the words `TOKEN`, `LEAK`, `OVERFLOW`, the
 128-byte callback offset, or the exact Supervisor diagnostic request. If no
