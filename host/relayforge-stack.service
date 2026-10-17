@@ -10,6 +10,7 @@ Environment=HOME=/run/relayforge-stack
 Environment=DOCKER_CONFIG=/run/relayforge-stack/docker-config
 RuntimeDirectory=relayforge-stack
 RuntimeDirectoryMode=0700
+ExecStartPre=/usr/bin/test -f /opt/relayforge/bin/relay-worker
 ExecStartPre=/usr/bin/docker compose --project-directory /opt/relayforge/app --env-file /etc/relayforge/compose.env config --quiet
 ExecStart=/usr/bin/docker compose --project-directory /opt/relayforge/app --env-file /etc/relayforge/compose.env up --detach --no-build --remove-orphans --wait --wait-timeout 120
 ExecStop=/usr/bin/docker compose --project-directory /opt/relayforge/app --env-file /etc/relayforge/compose.env down --timeout 15

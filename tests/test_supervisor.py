@@ -246,6 +246,47 @@ def test_diagnostic_controls_and_race() -> None:
         race_path.unlink()
         race_path.write_bytes(module.DIAGNOSTIC_SCRIPT)
         race_path.chmod(module.DIAGNOSTIC_MODE)
+
+        # Correct metadata with incorrect content must still fail.
+        race_path.write_bytes(b"X" * len(module.DIAGNOSTIC_SCRIPT))
+        race_path.chmod(module.DIAGNOSTIC_MODE)
+        server, client = socket.socketpair()
+        try:
+            expect_error(
+                lambda: broker.run_diagnostic(request, os.getpid(), server),
+                module.ProtocolError,
+            )
+        finally:
+            server.close()
+            client.close()
+
+        # Extra bytes and a second hard link are independently rejected.
+        race_path.write_bytes(module.DIAGNOSTIC_SCRIPT + b"x")
+        race_path.chmod(module.DIAGNOSTIC_MODE)
+        server, client = socket.socketpair()
+        try:
+            expect_error(
+                lambda: broker.run_diagnostic(request, os.getpid(), server),
+                module.ProtocolError,
+            )
+        finally:
+            server.close()
+            client.close()
+        race_path.write_bytes(module.DIAGNOSTIC_SCRIPT)
+        race_path.chmod(module.DIAGNOSTIC_MODE)
+        hardlink = work / "diagnostic-hardlink"
+        os.link(race_path, hardlink)
+        server, client = socket.socketpair()
+        try:
+            expect_error(
+                lambda: broker.run_diagnostic(request, os.getpid(), server),
+                module.ProtocolError,
+            )
+        finally:
+            server.close()
+            client.close()
+            hardlink.unlink()
+
         server, client = socket.socketpair()
         try:
             expect_error(
@@ -272,6 +313,44 @@ def test_diagnostic_controls_and_race() -> None:
             server.close()
             client.close()
 
+        broker._peer_in_job = lambda _pid, _unit: True
+        broker._unit_active = lambda _unit: False
+        server, client = socket.socketpair()
+        try:
+            expect_error(
+                lambda: broker.run_diagnostic(request, os.getpid(), server),
+                PermissionError,
+            )
+        finally:
+            server.close()
+            client.close()
+
+        broker._unit_active = lambda _unit: True
+        broker.active[job_id] = module.ActiveJob(
+            job_id, active.unit, active.port, time.time() - 1, run_dir
+        )
+        server, client = socket.socketpair()
+        try:
+            expect_error(
+                lambda: broker.run_diagnostic(request, os.getpid(), server),
+                PermissionError,
+            )
+        finally:
+            server.close()
+            client.close()
+
+        broker.active = {}
+        server, client = socket.socketpair()
+        try:
+            expect_error(
+                lambda: broker.run_diagnostic(request, os.getpid(), server),
+                PermissionError,
+            )
+        finally:
+            server.close()
+            client.close()
+
+        broker.active = {job_id: active}
         broker._peer_in_job = lambda _pid, _unit: False
         server, client = socket.socketpair()
         try:
@@ -316,6 +395,37 @@ def test_diagnostic_rejects_unauthorized_kernel_uid() -> None:
     assert called is False
 
 
+def test_rpc_identity_operation_matrix() -> None:
+    broker = module.Supervisor.__new__(module.Supervisor)
+    broker.dispatch_uid = 12001
+    broker.relay_uid = 12002
+    calls: list[str] = []
+    broker.launch = lambda _message: calls.append("launch") or {"ok": True}
+    broker.stop = lambda _message: calls.append("stop") or {"ok": True}
+    broker.run_diagnostic = lambda *_arguments: calls.append("diagnose")
+    previous_credentials = module._peer_credentials
+    previous_reader = module._read_request
+    cases = (
+        (broker.relay_uid, {"op": "launch"}),
+        (broker.relay_uid, {"op": "stop"}),
+        (broker.dispatch_uid, {"op": "diagnose"}),
+    )
+    try:
+        for uid, request in cases:
+            module._peer_credentials = lambda _connection, uid=uid: (4321, uid, uid)
+            module._read_request = lambda _connection, request=request: request
+            server, client = socket.socketpair()
+            client.settimeout(2)
+            module.handle_connection(broker, server)
+            reply = json.loads(_recv_line(client))
+            client.close()
+            assert reply == {"error": "PermissionError", "ok": False}
+    finally:
+        module._peer_credentials = previous_credentials
+        module._read_request = previous_reader
+    assert calls == []
+
+
 def test_confirmed_idempotent_stop() -> None:
     with tempfile.TemporaryDirectory(prefix="relayforge-supervisor-stop-") as name:
         job_id = str(uuid.uuid4())
@@ -355,6 +465,7 @@ def main() -> None:
     test_signature_validation()
     test_diagnostic_controls_and_race()
     test_diagnostic_rejects_unauthorized_kernel_uid()
+    test_rpc_identity_operation_matrix()
     test_confirmed_idempotent_stop()
     print("PASS: Supervisor launch/stop/diagnose gates hold; root-exec TOCTOU is reachable")
 

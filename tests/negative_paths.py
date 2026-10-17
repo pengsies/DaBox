@@ -110,6 +110,7 @@ def main() -> int:
         expected_http(authenticated, f"{base}/api/status/{uuid.uuid4()}", 404)
         expected_http(authenticated, f"{base}/api/result?name=../root.txt", 400)
         expected_http(authenticated, f"{base}/var/cache/{'0' * 32}.txt", 404)
+        expected_http(authenticated, f"{base}/STAGE_1_WEB.txt", 404)
         expected_http(
             authenticated,
             json_post(

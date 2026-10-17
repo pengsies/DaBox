@@ -3,7 +3,10 @@
 > **Unrestricted-root variant:** a successful player obtains real UID 0 on the
 > Ubuntu host. Use a disposable, single-player VM with no IAM role, reusable
 > credentials, sensitive data, or other workloads. Do not install this branch
-> on the shared Group 30 EC2. Read `UNRESTRICTED_ROOT_WARNING.md` first.
+> on a shared or persistent server. The assigned Group 30 EC2 is suitable only
+> while it is dedicated to this lab, has no valuable data or IAM role, and is
+> recreated after a player reaches root. Read `UNRESTRICTED_ROOT_WARNING.md`
+> first.
 
 This is the authoritative setup guide for the bounded-lifetime Flask release.
 The RelayForge host must be a native **Ubuntu Server 24.04.x LTS AMD64**
@@ -21,6 +24,277 @@ downloads packages and pulls/builds images.
 For recovery of the existing Group 30 EC2, including why each permission and
 service change is made, see `EC2_RECOVERY_AND_UPGRADE.md`.
 
+## How the Vulnerability Chain Was Designed and Built
+
+This section records the implementation process behind the challenge. It
+starts with the ordinary relay service and explains how each deliberate
+weakness was added at a specific trust boundary, what capability that stage
+provides, and what protections remain around it. The design goal was a
+connected learning path, not five unrelated ways to run commands:
+
+```text
+authenticated portal
+  -> command execution in the Web container
+  -> narrow request-enqueue capability
+  -> Access/Worker interpretation mismatch
+  -> temporary native Worker as host relay
+  -> root Supervisor pathname race
+  -> unrestricted host UID 0
+```
+
+The implementation deliberately preserves intermediate boundaries. Web
+execution remains container UID 65532; the database pivot cannot sign jobs;
+the Worker is a host process running as unprivileged `relay`; and only the
+last Supervisor stage reaches host UID 0. The sections below describe how the
+authors assembled that path and why the surrounding controls were retained.
+
+### Build Phase 1: Establish the Relay Service Before Adding the Challenge
+
+The starting point was a real service to investigate: an authenticated Flask
+portal accepts a connection request, PostgreSQL stores it, Access makes a
+policy decision and signs approved job data, Dispatcher forwards that signed
+data to the host, and a temporary Worker tunnels to a private HTTP fixture.
+The Docker and host split was chosen before adding the vulnerabilities because
+the learning objective depends on crossing distinct privilege domains.
+
+The production stack has five containers: Nginx edge, Flask Web, PostgreSQL,
+Access, and Dispatcher. The backend endpoint, Supervisor, firewall controls,
+and transient Worker are host services. The endpoint is pinned to a configured
+host IPv4 and port; request options do not control routing. Public ingress is
+HTTPS on 443, while a Worker receives a temporary port from 25000-25099 only
+after an approved request is dispatched. This gives the first investigation a
+normal browser workflow before any shell or binary-analysis tools are needed.
+
+The common container policy in [compose.yaml](compose.yaml) was then used to
+make the Web foothold meaningful but contained: services are read-only where
+possible, drop Linux capabilities, enable `no-new-privileges`, have resource
+limits, and do not receive the Docker socket. Web runs as UID 65532. Its
+database network access is intentional; host-control access is not.
+
+### Build Phase 2: Add the Authenticated Web Foothold
+
+The first challenge flaw was placed in the remembered-preferences feature.
+Login issues a `remember_prefs` cookie representing `RememberedPrefs`, and the
+authenticated dashboard restores that cookie when it renders. The cookie is
+base64 encoded and the unpickler has a class allowlist, because the lesson is
+that a restricted deserializer can still be unsafe when an allowed object's
+state hook has side effects.
+
+The implementation adds two allowed classes with complementary hooks:
+`JobTemplate.__setstate__` stores a command in a process-local queue, and
+`JobRunner.__setstate__` consumes that queued command and starts it with
+`subprocess.Popen(..., shell=True)`. Pickle's object restoration order joins
+the hooks into one gadget. The authenticated trigger is the call to
+`remembered_username()` on the dashboard route. Relevant implementation is in
+[web/prefs.py](web/prefs.py), [web/app/auth.py](web/app/auth.py), and
+[web/app/__init__.py](web/app/__init__.py).
+
+The child is detached and its ordinary stdout/stderr are discarded. To make
+the first-stage result testable, the exploit payload writes output to a
+temporary result file, and Web exposes an authenticated, size-bounded,
+one-shot read route. That mechanism is an observation channel for the lab,
+not an additional privilege escalation. It was important to keep the process
+in the Web container so the result proves only UID 65532 execution, not host
+access.
+
+Excerpt showing how the allowed state hooks compose, from
+[web/prefs.py](web/prefs.py):
+
+```python
+class JobTemplate:
+    pending: list[str] = []
+
+    def __setstate__(self, state) -> None:
+        self.__dict__.update(state)
+        JobTemplate.pending.append(self.command)
+
+
+class JobRunner:
+    def __setstate__(self, state) -> None:
+        self.__dict__.update(state)
+        if JobTemplate.pending:
+            subprocess.Popen(
+                JobTemplate.pending.pop(), shell=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+```
+
+The class allowlist and authenticated restore point are separate parts of the
+setup. A class hook alone is inert if no attacker-controlled pickle reaches
+it; a client-controlled pickle is also not sufficient if every permitted class
+is harmless. The challenge intentionally combines both conditions.
+
+One deployment limitation remains part of the design record: the public login
+form does not reveal the seeded account. An IP-only event therefore needs an
+organizer-supplied account clue or a separately tested, bounded recovery step.
+The login throttle makes arbitrary online wordlist guessing a poor substitute
+for a designed entry clue.
+
+### Build Phase 3: Turn Web Execution into a Narrow Database Pivot
+
+After the Web foothold was established, the next design decision was to avoid
+giving the compromised process broad database authority. PostgreSQL separates
+private tables from service APIs. `relay_web` cannot read private request/job
+tables or call Access and Dispatcher APIs, but it is granted execution on one
+additional `SECURITY DEFINER` function,
+`relay_web_api.submit_raw_request(...)`. The ordinary Web routes continue to
+call only `submit_safe_request`; no public HTTP handler accepts raw options.
+
+The adapter for the retained function is present in
+[web/app/db.py](web/app/db.py), and its SQL definition and explicit grants are
+in [db/init/002-schema.sql.in](db/init/002-schema.sql.in). The function uses
+the same bounded enqueue path as ordinary requests and returns a request UUID.
+This was designed as a post-compromise capability: it lets an attacker with
+Web command execution ask the normal Access service to evaluate a request, but
+does not provide the signing key, private job rows, or direct Worker launch.
+
+The vulnerable grant is therefore a narrow exception surrounded by explicit
+revocations. The normal dashboard remains a useful control case because it
+cannot submit arbitrary `options_raw`; the raw function is only reachable
+through the already-compromised Web process.
+
+### Build Phase 4: Create the Access/Worker Parser Mismatch
+
+The cross-service flaw was added by having Access and Worker independently
+interpret the same bounded option string. The grammar permits one or two
+`profile` pairs and exactly one `note`. Access chooses the first profile and
+requires it to be `safe`; the Worker processes pairs in order and keeps the
+last profile. With `safe` first and `legacy` last, Access approves while the
+Worker enables its legacy debug commands. Reversing the order is the negative
+case: Access rejects it.
+
+This mismatch gives the challenge a controlled policy lesson without placing a
+target host, URL, path, or command in the raw options. The endpoint remains
+resolved from a protected target record. Access still checks user grant,
+target enablement, service, duration, and grammar, then signs the canonical
+job envelope. Dispatcher forwards those exact signed bytes and Supervisor
+validates them before launch. The flaw is the disagreement about duplicate
+keys, not a bypass of signature verification or routing integrity.
+
+The implementation is split deliberately: Access semantics are in
+[control/policy.py](control/policy.py), and Worker semantics are in
+[worker/relay-worker.c](worker/relay-worker.c). Keeping the parsers separate
+makes the differential real: neither component calls the other's parser or
+shares a parsed result.
+
+### Build Phase 5: Build the Native Worker Stage
+
+The Worker was implemented as a native AMD64 host binary so the exercise could
+move from container command execution to an unprivileged host identity. It
+starts only after Access signs an approved request and Dispatcher delivers it
+to Supervisor. Supervisor creates a transient systemd unit under `relay`,
+chooses an available port in 25000-25099, generates a 48-hex bearer token, and
+starts the Worker for a bounded 30-420 seconds. The port and token are returned
+to the authenticated request owner only after readiness succeeds.
+
+The Worker retains a normal tunnel command (`CONNECT`) and a browser HTTP
+relay. The intentional debug behavior is only enabled when the parser has
+selected legacy mode. `LEAK` prints the current address of `worker_shell` to
+illustrate why PIE alone does not prevent exploitation when an address is
+disclosed. `OVERFLOW` accepts no more than the full 136-byte frame. Its first
+128 bytes are data and its next eight bytes are the callback pointer. The
+bounded copy then invokes the callback. Redirecting it to the leaked shell
+function gives a shell as `relay`, not root.
+
+The struct size and offset are compile-time asserted in
+[worker/relay-worker.c](worker/relay-worker.c). The compiler flags in
+[worker/Makefile](worker/Makefile) retain PIE, stack protection, NX, RELRO, and
+immediate binding. Those defenses are not disabled to make the exploit work;
+the intended exercise uses information disclosure plus callback replacement,
+not injected shellcode or an unbounded overwrite.
+
+The artifact used for analysis must be the one the host executes. The installer
+builds `/opt/relayforge/bin/relay-worker`, and Compose mounts that exact file
+read-only into Nginx. `robots.txt` advertises the artifact path so a player can
+find it through ordinary web enumeration instead of guessing a hidden URL.
+The Nginx locations are in [config/nginx.conf](config/nginx.conf), and the
+mount and byte-identity verification are defined in
+[compose.yaml](compose.yaml) and `scripts/verify-hardening.sh`.
+
+### Build Phase 6: Add the Root Supervisor Race
+
+The final stage was added to the host Supervisor, not to Docker or the Web
+container. The `diagnose` operation first restricts its caller to the `relay`
+UID in the exact active Worker cgroup, checks the job deadline and exact
+filename, and validates a benign `diagnostic.sh` through an open descriptor.
+The file must be a regular file, relay-owned, single-link, mode 0700, the
+expected size, and contain the exact approved bytes. These checks make the
+operation specific to the current Worker and rule out filename, symlink, and
+content substitutions before validation.
+
+The deliberate race is introduced after those checks: Supervisor closes the
+validated descriptor, sends the `validated` acknowledgement, waits 250 ms,
+then opens the pathname again implicitly by executing it with `Popen(path)`.
+The Worker can atomically replace that pathname during the interval. Because
+validation and execution refer to the same name but not the same open file
+object, the root process may execute different bytes from the ones it checked.
+The Supervisor passes the same socket to the child as standard input, output,
+and error so successful replacement is observable as a command stream.
+
+The service unit is deliberately not sandboxed from the host privilege domain:
+it runs as root, resets its capability bounding set to the full kernel set,
+and does not apply filesystem or namespace protections. Consequently, this
+stage produces genuine unrestricted host UID 0 rather than a constrained
+flag-reading helper. The implementation is in
+[host/supervisor.py](host/supervisor.py) and
+[host/relay-supervisor.service](host/relay-supervisor.service). This is an
+intentional, dangerous challenge configuration; the installer requires an
+explicit acknowledgement, and a solved VM must be destroyed and recreated.
+
+### Build Phase 7: Integrate, Package, and Verify the Chain
+
+Once the stages were implemented separately, the release was assembled around
+explicit trust and file boundaries:
+
+- `compose.yaml` defines the five containers, internal networks, resource
+  limits, read-only filesystems, dropped capabilities, and the exact public
+  Nginx mount for the Worker artifact.
+- `db/init/002-schema.sql.in` creates separate database roles and APIs, then
+  revokes direct service-role access before granting only the required
+  functions.
+- The host services install the backend fixture, firewall, root Supervisor,
+  and transient Worker lifecycle.
+- `scripts/install.sh` builds the Worker, creates fresh secrets, installs
+  allowlisted runtime files, configures the host, and runs hardening checks.
+- `scripts/verify-hardening.sh` checks container identities, network
+  publication, database grants, marker permissions, Worker protections, SSH,
+  firewall rules, and the Supervisor's intentionally unrestricted mode.
+- Unit, integration, negative-path, and full-chain tests check local behavior
+  and the deployed boundaries. Tests that perform the final root race must run
+  only on a disposable VM prepared for destruction afterward.
+
+The release process is intentionally separate from the player attack. The
+organizer builds and verifies a complete bundle; the player receives only the
+approved target information and any explicitly designed initial clue/artifact.
+Repository test files and exploit helpers are validation and organizer tools,
+not files installed into `/opt/relayforge` or the Web image. The exact installed
+allowlists are recorded below in the deployment portion of this guide.
+
+This narrative describes the checked-in construction. A source excerpt or
+passing local test does not prove that a particular EC2 instance is running
+those exact bytes. Deployment-specific claims require the installer
+verification and external acceptance results to be recorded separately.
+
+### Stage Markers and Validation
+
+The three stage files indicate the privilege boundary reached: Web UID 65532,
+host `relay`, and host UID 0. They are explanatory breadcrumbs, not scoring
+flags or proof by themselves. The generated scoring flag remains
+`/var/lib/relayforge/flag/root.txt`, readable only by root.
+
+The setup and verification scripts install the marker files with distinct
+ownership and modes, keep the Web container away from host stage files, and
+verify that `relay` can read Stage 2 but not Stage 3 or the flag. The source
+tests exercise the parser decisions, Worker protocol and frame assumptions,
+Supervisor gates, and pathname replacement. Local tests establish behavior of
+the checked-in implementation; only the deployment checks and an authorized
+external run establish that the target instance is configured as intended.
+The full root-chain acceptance test intentionally obtains host UID 0 and should
+be run only when the operator is prepared to destroy and recreate that VM.
+
 ## 1. Required files
 
 Distribute these two files together:
@@ -30,9 +304,9 @@ RelayForge-Responsibilities-Flask-v1.zip
 RelayForge-Responsibilities-Flask-v1.zip.sha256
 ```
 
-Do not distribute `responsibilities/diff/` or the raw teammate prototypes as
-deployment inputs. The release archive contains only the integrated
-`responsibilities/shared/` tree.
+Build and distribute the release from the authoritative DaBox repository root.
+Do not mix in an older extraction, teammate prototype, or historical
+comparison directory.
 
 ## 2. Create the Windows VM
 
@@ -234,6 +508,9 @@ python3 tests/supervisor_systemd_integration.py
 The Docker architecture must be `x86_64` or `amd64`; none of these commands
 should print `FAIL`. The systemd integration should run, not print the ARM-host
 skip message. The disposable suites remove their test containers and volumes.
+Membership in the `docker` group is host-root-equivalent; it is acceptable for
+the VM administrator during this disposable preflight, but never grant it to a
+player or service identity and remove it when it is no longer needed.
 Run this endpoint preflight before the full installation because the installed
 `relay-backend.service` later owns loopback port 19001. Do not install Docker
 from Snap, use rootless Docker, enable user-namespace remapping, or pre-create a
@@ -300,6 +577,23 @@ database passwords, an Ed25519 signing key, a Flask secret and a self-signed
 TLS certificate, pulls/builds the five containers, installs the systemd units,
 applies the firewall/SSH policy, starts the stack, and runs host verification.
 
+It also reconciles the RelayForge-owned installed footprint from explicit
+allowlists. `/opt/relayforge/app` receives only Compose and the build inputs
+used by nginx, Control, PostgreSQL, and Web; repository tests, attack helpers,
+and READMEs stay in the release tree. `/opt/relayforge/runtime` contains the
+four Python host programs and five supported lifecycle scripts, while
+`/opt/relayforge/bin` contains only `relay-worker`. The installer removes the
+exact obsolete `relay-cleanup.{service,timer}`, `relay-rotate.{service,timer}`,
+and permanent `relay-worker.service` units. It also removes the one recognized
+bounded-root Supervisor override after moving its useful runtime-directory
+preservation into the canonical unit. Any other Supervisor drop-in causes a
+fail-closed stop. The canonical service explicitly resets its capability
+bounding set to the full kernel set. It does not delete home files,
+arbitrary `/tmp` entries, foreign containers, images or volumes, OS/AWS
+services, secrets, flags, active transient Worker state, or the PostgreSQL
+volume. Here, “essentials only” means this bounded RelayForge footprint—not
+stripping a normal Ubuntu installation.
+
 The installer also copies the version-controlled
 `config/60-relayforge-sysctl.conf` to
 `/etc/sysctl.d/60-relayforge.conf`. Make lasting sysctl changes in the project
@@ -310,9 +604,16 @@ RelayForge expects these runtime ownership boundaries:
 ```text
 /etc/relayforge/job-signing.pub       root:root            0444
 /var/lib/relayforge/workers           root:root            0711
+/var/lib/relayforge/stages            root:root            0711
+/var/lib/relayforge/stages/STAGE_2_WORKER.txt root:relayforge-ipc 0440
+/var/lib/relayforge/stages/STAGE_3_ROOT.txt   root:root           0400
 /var/lib/relayforge/flag/root.txt     root:root            0600
 /run/relayforge/supervisor.sock       root:relayforge-ipc  0660
 ```
+
+The Web image separately contains `/opt/relayforge/web/STAGE_1_WEB.txt` as
+`root:root` mode `0444`. See `STAGE_MARKERS.md`; these are explanatory markers,
+while `root.txt` is the generated secret.
 
 Supervisor dynamically recreates the socket and repairs the Worker-state
 parent. The main `/etc/ssh/sshd_config` may safely be root-owned mode `0600` or
@@ -327,9 +628,11 @@ disposable VM when changing the endpoint.
 ### Updating an existing installation
 
 Use the same recorded player CIDR, public interface, administrator, and endpoint
-values. Cancel active connections through the portal or wait for their bounded
-lifetime to expire, confirm no Worker is running, and then rerun the installer
-from a newly verified and newly extracted release:
+values, then rerun the installer from a newly verified and newly extracted
+release. If the candidate Worker bytes differ, the installer refuses to begin
+the upgrade while a transient Worker is active. Wait for its bounded expiry or
+cancel it during the maintenance window, then rerun. When the Worker bytes are
+unchanged, active transient Workers and state are preserved:
 
 ```bash
 sudo systemctl list-units --state=running --type=service 'relay-worker-*'
@@ -343,9 +646,10 @@ sudo ./scripts/install.sh \
 sudo strings /opt/relayforge/bin/relay-worker | grep -E 'HTTP/1\.1|/relay/'
 ```
 
-Both Worker markers must be present. A Worker that was already running when the
-binary was replaced retains its old loaded executable; create a new portal
-request after the update.
+Both Worker protocol strings must be present. The installer prints the deployed
+Worker SHA-256, recreates the edge container, and the hardening verifier proves
+that the public download is byte-identical to the installed executable. Create
+a new portal request after the update for functional acceptance.
 
 To change a public deployment back to one trusted player network without
 reinstalling:
@@ -365,12 +669,19 @@ sudo systemctl is-active docker.service relay-backend.service \
   relay-supervisor.service relayforge-firewall.service relayforge-stack.service
 sudo docker compose --project-directory /opt/relayforge/app \
   --env-file /etc/relayforge/compose.env ps
-curl --fail http://127.0.0.1:19001/health
-curl --fail --insecure https://127.0.0.1/healthz
+python3 - <<'PY'
+import ssl, urllib.request
+assert urllib.request.urlopen("http://127.0.0.1:19001/health", timeout=5).read() == b"ok\n"
+context = ssl._create_unverified_context()
+assert urllib.request.urlopen("https://127.0.0.1/healthz", context=context, timeout=5).read() == b"ok\n"
+print("PASS: private endpoint and HTTPS edge are healthy")
+PY
 ```
 
-Acceptance requires zero deployment-verification failures, five healthy containers, all
-listed host services active, and both health requests succeeding.
+Acceptance requires zero deployment-verification failures, five healthy
+containers, all listed host services active, and both health requests
+succeeding. Verification also checks the Stage 1/2/3 marker boundaries, exact
+managed runtime trees, and absence of the five legacy units.
 
 For a host-local functional run, use:
 
@@ -474,11 +785,11 @@ The release is fully accepted only when all of these are true:
 - **A service fails:** collect `sudo systemctl status <unit>` and
   `sudo journalctl -u <unit> -n 200 --no-pager` before resetting the VM.
 
-## 13. Optional housekeeping
+## 13. Optional footprint audit and bounded housekeeping
 
-No periodic cleanup is required. Supervisor normally reaps expired Worker
-state, Compose starts with `--remove-orphans`, and old images are harmless while
-disk space remains adequate.
+The installer removes unsupported files from its three managed `/opt` trees
+and the exact legacy units. Supervisor reaps valid expired Worker state, and
+Compose starts with `--remove-orphans`. Inspect before any further cleanup:
 
 Inspect before removing anything:
 
@@ -498,10 +809,13 @@ status is safe and cosmetic:
 sudo systemctl reset-failed 'relay-worker-*.service'
 ```
 
-Old, positively identified `/tmp/relayforge-*` extraction/build directories may
-be removed after the verified ZIP and checksum are retained. Do not manually
-remove `/opt/relayforge`, `/etc/relayforge`, `/var/lib/relayforge`, or any
-RelayForge Docker volume. Do not use `docker system prune -a --volumes`,
+Old, positively identified extraction/build directories may be removed one at
+a time after the verified ZIP and checksum are retained. The installer does
+not use broad `/tmp` globs or erase administrator home files, and it does not
+infer that an unlabelled container, image, volume, AWS agent, or Ubuntu package
+is disposable. Do not manually remove `/opt/relayforge`, `/etc/relayforge`,
+`/var/lib/relayforge`, or any RelayForge Docker volume. Do not use broad
+`apt autoremove`/package purges, `docker system prune -a --volumes`,
 `docker volume prune`, or `docker compose down --volumes` as housekeeping.
 
 `sudo /opt/relayforge/runtime/reset-lab.sh --yes` is a destructive challenge

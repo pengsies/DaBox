@@ -4,6 +4,11 @@ umask 077
 
 passes=0
 failures=0
+verification_scratch=$(mktemp -d /tmp/relayforge-verify.XXXXXX) || {
+  echo "Unable to create verification scratch directory." >&2
+  exit 1
+}
+trap 'rm -rf -- "$verification_scratch"' EXIT
 pass() { printf 'PASS  %s\n' "$1"; ((passes+=1)); }
 fail() { printf 'FAIL  %s\n' "$1" >&2; ((failures+=1)); }
 expect_command() {
@@ -11,12 +16,33 @@ expect_command() {
   shift
   if "$@" >/dev/null 2>&1; then pass "$label"; else fail "$label"; fi
 }
+expect_failure() {
+  local label=$1
+  shift
+  if "$@" >/dev/null 2>&1; then fail "$label"; else pass "$label"; fi
+}
 expect_file() {
   local path=$1 owner=$2 group=$3 mode=$4 label=$5
   local observed
   if [[ -L $path || ! -f $path ]]; then fail "$label"; return; fi
   observed=$(stat -c '%U:%G:%a' "$path" 2>/dev/null || true)
   if [[ $observed == "$owner:$group:$mode" ]]; then pass "$label"; else fail "$label ($observed)"; fi
+}
+expect_directory() {
+  local path=$1 owner=$2 group=$3 mode=$4 label=$5
+  local observed
+  if [[ -L $path || ! -d $path ]]; then fail "$label"; return; fi
+  observed=$(stat -c '%U:%G:%a' "$path" 2>/dev/null || true)
+  if [[ $observed == "$owner:$group:$mode" ]]; then pass "$label"; else fail "$label ($observed)"; fi
+}
+expect_exact_children() {
+  local path=$1 label=$2
+  shift 2
+  local observed expected
+  if [[ -L $path || ! -d $path ]]; then fail "$label"; return; fi
+  observed=$(find "$path" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sort)
+  expected=$(printf '%s\n' "$@" | sort)
+  if [[ $observed == "$expected" ]]; then pass "$label"; else fail "$label ($observed)"; fi
 }
 
 if [[ ${EUID} -ne 0 ]]; then
@@ -36,6 +62,20 @@ for unit in docker.service relay-backend.service relay-supervisor.service relayf
   expect_command "$unit is active" systemctl is-active --quiet "$unit"
   expect_command "$unit is enabled" systemctl is-enabled --quiet "$unit"
 done
+for legacy_unit in \
+  relay-cleanup.service \
+  relay-cleanup.timer \
+  relay-rotate.service \
+  relay-rotate.timer \
+  relay-worker.service; do
+  expect_failure "$legacy_unit was removed" systemctl cat "$legacy_unit"
+done
+if [[ ! -e /etc/systemd/system/relay-supervisor.service.d && \
+      ! -L /etc/systemd/system/relay-supervisor.service.d ]]; then
+  pass "Supervisor has no overriding systemd drop-ins"
+else
+  fail "Supervisor has no overriding systemd drop-ins"
+fi
 
 if grep -qx 'FIREWALL_DEFERRED=0' /etc/relayforge/install.state 2>/dev/null; then
   pass "firewall was not deferred"
@@ -59,13 +99,58 @@ expect_file /etc/relayforge/secrets/job-signing.pem root relayforge-signing 440 
 expect_file /etc/relayforge/job-signing.pub root root 444 "verification key is immutable to services"
 expect_file /etc/relayforge/secrets/tls/server.key root root 400 "TLS private key is root-only"
 expect_file /var/lib/relayforge/flag/root.txt root root 600 "root flag is root-only"
+expect_directory /var/lib/relayforge/stages root root 711 "stage-marker directory has traverse-only public access"
+expect_file /var/lib/relayforge/stages/STAGE_2_WORKER.txt root relayforge-ipc 440 "Worker stage marker is IPC-group-readable"
+expect_file /var/lib/relayforge/stages/STAGE_3_ROOT.txt root root 400 "root stage marker is root-only"
+expect_command "root stage marker has canonical identity" grep -qx \
+  'RELAYFORGE_STAGE=3_UNRESTRICTED_HOST_ROOT' \
+  /var/lib/relayforge/stages/STAGE_3_ROOT.txt
+expect_directory /opt/relayforge/bin root root 755 "Worker binary directory is root-owned"
 expect_file /opt/relayforge/bin/relay-worker root root 755 "Worker executable is root-owned"
+expect_command "relay can read only its Worker stage marker" runuser -u relay -- \
+  grep -qx 'RELAYFORGE_STAGE=2_HOST_RELAY_WORKER' \
+  /var/lib/relayforge/stages/STAGE_2_WORKER.txt
+expect_failure "relay cannot read the root stage marker" runuser -u relay -- \
+  cat /var/lib/relayforge/stages/STAGE_3_ROOT.txt
+expect_failure "relay cannot read the generated root flag" runuser -u relay -- \
+  cat /var/lib/relayforge/flag/root.txt
+expect_failure "backend identity cannot read the Worker stage marker" runuser -u relay-backend -- \
+  cat /var/lib/relayforge/stages/STAGE_2_WORKER.txt
+
+if [[ $(id -nG relay) == relayforge-ipc && \
+      $(id -nG relay-dispatch) == relayforge-ipc && \
+      $(id -nG relay-backend) == relay-backend ]]; then
+  pass "service identities have only their intended primary group"
+else
+  fail "service identities have only their intended primary group"
+fi
+if find /opt/relayforge /var/lib/relayforge -xdev -type f -perm /6000 -print -quit | grep -q .; then
+  fail "managed runtime trees contain no setuid/setgid files"
+else
+  pass "managed runtime trees contain no setuid/setgid files"
+fi
 
 if find /opt/relayforge -xdev \( -type f -o -type d \) -perm /0022 -print -quit | grep -q .; then
   fail "runtime tree has no group/world-writable entries"
 else
   pass "runtime tree has no group/world-writable entries"
 fi
+expect_exact_children /opt/relayforge/app \
+  "Compose installation contains only its five runtime roots" \
+  compose.yaml config control db web
+expect_exact_children /opt/relayforge/app/config \
+  "Compose config contains only nginx runtime configuration" nginx.conf
+expect_exact_children /opt/relayforge/app/db \
+  "Compose database context contains only initialization input" init
+expect_exact_children /opt/relayforge/app/web \
+  "Compose Web context excludes repository-only tests and tools" \
+  .dockerignore Dockerfile STAGE_1_WEB.txt app prefs.py requirements.txt static templates
+expect_exact_children /opt/relayforge/runtime \
+  "host runtime contains only the supported programs" \
+  backend.py cleanup_state.py configure-firewall.sh firewall.py harden-ssh.sh \
+  init-challenge.sh reset-lab.sh supervisor.py verify-hardening.sh
+expect_exact_children /opt/relayforge/bin \
+  "host binary directory contains only relay-worker" relay-worker
 # Exclude this verifier because the search expression below is intentionally
 # present in its own source and is not private-key material.
 if grep -RIlE --exclude='*.pub' --exclude='verify-hardening.sh' \
@@ -83,9 +168,10 @@ expect_command "Worker has immediate binding/full RELRO" bash -c "readelf -dW /o
 supervisor_properties=$(systemctl show relay-supervisor.service \
   -p User -p Group -p NoNewPrivileges -p ProtectSystem -p ProtectHome \
   -p PrivateDevices -p RestrictSUIDSGID -p MemoryDenyWriteExecute \
-  -p CapabilityBoundingSet 2>/dev/null)
+  -p RuntimeDirectoryPreserve -p CapabilityBoundingSet 2>/dev/null)
 if [[ $supervisor_properties == *$'User=root'* && \
       $supervisor_properties == *$'Group=relayforge-ipc'* && \
+      $supervisor_properties == *$'RuntimeDirectoryPreserve=yes'* && \
       $supervisor_properties == *$'NoNewPrivileges=no'* && \
       $supervisor_properties == *$'ProtectSystem=no'* && \
       $supervisor_properties == *$'ProtectHome=no'* && \
@@ -96,15 +182,28 @@ if [[ $supervisor_properties == *$'User=root'* && \
 else
   fail "Supervisor is intentionally unrestricted for the host-root challenge"
 fi
-supervisor_capabilities=${supervisor_properties,,}
-if [[ $supervisor_capabilities == *cap_chown* && \
-      $supervisor_capabilities == *cap_dac_override* && \
-      $supervisor_capabilities == *cap_net_admin* && \
-      $supervisor_capabilities == *cap_sys_admin* && \
-      $supervisor_capabilities == *cap_sys_ptrace* ]]; then
-  pass "Supervisor retains the host-root capability boundary intentionally"
+supervisor_pid=$(systemctl show relay-supervisor.service -p MainPID --value 2>/dev/null || true)
+capability_last=$(cat /proc/sys/kernel/cap_last_cap 2>/dev/null || true)
+full_capability_mask=$(
+  /usr/bin/python3 -c \
+    'import sys; value = int(sys.argv[1]); print(f"{(1 << (value + 1)) - 1:016x}")' \
+    "$capability_last" 2>/dev/null || true
+)
+supervisor_permitted=
+supervisor_effective=
+supervisor_bounding=
+if [[ $supervisor_pid =~ ^[1-9][0-9]*$ && -r /proc/$supervisor_pid/status ]]; then
+  supervisor_permitted=$(awk '$1 == "CapPrm:" { print tolower($2) }' "/proc/$supervisor_pid/status")
+  supervisor_effective=$(awk '$1 == "CapEff:" { print tolower($2) }' "/proc/$supervisor_pid/status")
+  supervisor_bounding=$(awk '$1 == "CapBnd:" { print tolower($2) }' "/proc/$supervisor_pid/status")
+fi
+if [[ -n $full_capability_mask && \
+      $supervisor_permitted == "$full_capability_mask" && \
+      $supervisor_effective == "$full_capability_mask" && \
+      $supervisor_bounding == "$full_capability_mask" ]]; then
+  pass "Supervisor has the full kernel capability set intentionally"
 else
-  fail "Supervisor retains the host-root capability boundary intentionally"
+  fail "Supervisor has the full kernel capability set intentionally ($supervisor_permitted/$supervisor_effective/$supervisor_bounding expected $full_capability_mask)"
 fi
 
 socket_metadata=$(stat -c '%U:%G:%a:%F' /run/relayforge/supervisor.sock 2>/dev/null || true)
@@ -180,6 +279,19 @@ else
   fail "container runtime controls ($unhealthy violations)"
 fi
 
+web_id=$("${compose[@]}" ps --quiet web 2>/dev/null)
+web_marker=$(docker exec "$web_id" stat -c '%u:%g:%a' \
+  /opt/relayforge/web/STAGE_1_WEB.txt 2>/dev/null || true)
+web_marker_line=$(docker exec "$web_id" sed -n '1p' \
+  /opt/relayforge/web/STAGE_1_WEB.txt 2>/dev/null || true)
+web_mounts=$(docker inspect --format '{{json .Mounts}}' "$web_id" 2>/dev/null || true)
+if [[ $web_marker == 0:0:444 && $web_marker_line == RELAYFORGE_STAGE=1_WEB_CONTAINER && \
+      $web_mounts != *'/var/lib/relayforge/stages'* ]]; then
+  pass "Web marker is immutable and host stage markers are not mounted"
+else
+  fail "Web marker is immutable and host stage markers are not mounted ($web_marker)"
+fi
+
 edge_id=$("${compose[@]}" ps --quiet edge 2>/dev/null)
 published=$(docker inspect --format '{{json .HostConfig.PortBindings}}' "$edge_id" 2>/dev/null || true)
 if [[ $published == *'"443/tcp"'* && $published == *'"HostIp":"0.0.0.0"'* && \
@@ -187,6 +299,80 @@ if [[ $published == *'"443/tcp"'* && $published == *'"HostIp":"0.0.0.0"'* && \
   pass "only edge HTTPS is Docker-published"
 else
   fail "only edge HTTPS is Docker-published"
+fi
+
+edge_worker_mount=$(
+  docker inspect --format \
+    '{{range .Mounts}}{{if eq .Destination "/etc/nginx/artifacts/relay-worker"}}{{.Type}}|{{.Source}}|{{.Destination}}|{{.RW}}{{end}}{{end}}' \
+    "$edge_id" 2>/dev/null || true
+)
+if [[ $edge_worker_mount == 'bind|/opt/relayforge/bin/relay-worker|/etc/nginx/artifacts/relay-worker|false' ]]; then
+  pass "edge has the exact read-only Worker artifact mount"
+else
+  fail "edge has the exact read-only Worker artifact mount ($edge_worker_mount)"
+fi
+
+worker_artifact_probe=$verification_scratch/relay-worker
+if /usr/bin/python3 - "$worker_artifact_probe" <<'PY'
+import pathlib
+import ssl
+import sys
+import urllib.request
+
+destination = pathlib.Path(sys.argv[1])
+context = ssl.create_default_context()
+context.check_hostname = False
+context.verify_mode = ssl.CERT_NONE
+
+
+def fetch(path: str):
+    request = urllib.request.Request(
+        f"https://127.0.0.1{path}",
+        headers={"User-Agent": "RelayForge deployment verifier"},
+    )
+    return urllib.request.urlopen(request, context=context, timeout=10)
+
+
+with fetch("/robots.txt") as response:
+    if response.status != 200:
+        raise SystemExit(f"robots.txt returned HTTP {response.status}")
+    robots = response.read(4097)
+    if len(robots) > 4096 or b"Allow: /artifacts/relay-worker" not in robots:
+        raise SystemExit("robots.txt does not advertise the Worker artifact")
+
+with fetch("/artifacts/relay-worker") as response:
+    if response.status != 200:
+        raise SystemExit(f"Worker artifact returned HTTP {response.status}")
+    if response.headers.get_content_type() != "application/octet-stream":
+        raise SystemExit("Worker artifact has the wrong content type")
+    if 'filename="relay-worker"' not in response.headers.get("Content-Disposition", ""):
+        raise SystemExit("Worker artifact has the wrong download filename")
+    if response.headers.get("Cache-Control") != "no-store":
+        raise SystemExit("Worker artifact is not marked no-store")
+    if response.headers.get("X-Content-Type-Options") != "nosniff":
+        raise SystemExit("Worker artifact is missing nosniff")
+    artifact = response.read(32 * 1024 * 1024 + 1)
+    if len(artifact) > 32 * 1024 * 1024:
+        raise SystemExit("Worker artifact exceeds the deployment size limit")
+    destination.write_bytes(artifact)
+PY
+then
+  host_worker_sha256=$(sha256sum /opt/relayforge/bin/relay-worker | awk '{print $1}')
+  edge_worker_sha256=$(
+    docker exec "$edge_id" sha256sum /etc/nginx/artifacts/relay-worker 2>/dev/null |
+      awk '{print $1}'
+  )
+  downloaded_worker_sha256=$(sha256sum "$worker_artifact_probe" | awk '{print $1}')
+  if cmp -s /opt/relayforge/bin/relay-worker "$worker_artifact_probe" && \
+     [[ $host_worker_sha256 =~ ^[0-9a-f]{64}$ && \
+        $host_worker_sha256 == "$edge_worker_sha256" && \
+        $host_worker_sha256 == "$downloaded_worker_sha256" ]]; then
+    pass "public Worker artifact is byte-identical to the deployed executable ($host_worker_sha256)"
+  else
+    fail "public Worker artifact differs from the deployed executable ($host_worker_sha256/$edge_worker_sha256/$downloaded_worker_sha256)"
+  fi
+else
+  fail "public Worker artifact and discovery route are reachable with canonical headers"
 fi
 
 db=("${compose[@]}" exec -T postgres psql -v ON_ERROR_STOP=1 -U postgres -d relayforge)

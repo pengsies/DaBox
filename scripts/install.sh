@@ -139,6 +139,18 @@ if [[ -e $compose_environment ]]; then
   fi
 fi
 
+# Reject known secret drift before package installation or service downtime.
+# An operator must inspect and repair/rotate an existing key deliberately.
+existing_private_key=/etc/relayforge/secrets/job-signing.pem
+if [[ -e $existing_private_key ]] && {
+     [[ -L $existing_private_key ]] ||
+     [[ ! -f $existing_private_key ]] ||
+     [[ $(stat -c '%U:%G:%a' "$existing_private_key") != root:relayforge-signing:440 ]];
+   }; then
+  echo "Unsafe existing signing-key ownership or mode; inspect it before installation." >&2
+  exit 1
+fi
+
 for selected in control db web config host scripts worker; do
   if find "$project_dir/$selected" -type l -print -quit | grep -q .; then
     echo "Refusing a source tree containing symbolic links: $selected" >&2
@@ -146,13 +158,30 @@ for selected in control db web config host scripts worker; do
   fi
 done
 
+# Installing/upgrading Docker may restart its daemon and interrupt every
+# running container.  Check before apt changes anything.  RelayForge is a
+# dedicated-host lab, so refuse when another Compose project (or an unlabelled
+# container) is active.  Stopped foreign containers are left untouched.
+if systemctl is-active --quiet docker.service && command -v docker >/dev/null 2>&1; then
+  foreign_containers=$(
+    docker ps --format '{{.ID}} {{.Names}} {{.Label "com.docker.compose.project"}}' |
+      awk 'NF < 3 || $3 != "relayforge" { print }'
+  )
+  if [[ -n $foreign_containers ]]; then
+    echo "Refusing to reconcile a host with non-RelayForge containers running:" >&2
+    printf '%s\n' "$foreign_containers" >&2
+    exit 1
+  fi
+fi
+
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends \
-  binutils build-essential ca-certificates curl docker.io docker-compose-v2 iproute2 \
+  binutils build-essential ca-certificates docker.io docker-compose-v2 iproute2 \
   iptables openssh-server openssl python3 python3-cryptography rsync
 
 install -d -o root -g root -m 0755 /etc/docker
+docker_restart_required=0
 if [[ -e /etc/docker/daemon.json ]]; then
   if ! cmp -s "$project_dir/config/docker-daemon.json" /etc/docker/daemon.json; then
     echo "Existing /etc/docker/daemon.json differs; refusing to overwrite it." >&2
@@ -160,9 +189,17 @@ if [[ -e /etc/docker/daemon.json ]]; then
   fi
 else
   install -o root -g root -m 0644 "$project_dir/config/docker-daemon.json" /etc/docker/daemon.json
+  docker_restart_required=1
 fi
 systemctl enable docker.service
-systemctl restart docker.service
+if systemctl is-active --quiet docker.service; then
+  if [[ $docker_restart_required -eq 1 ]]; then
+    systemctl stop relayforge-stack.service 2>/dev/null || true
+    systemctl restart docker.service
+  fi
+else
+  systemctl start docker.service
+fi
 docker_info=$(docker info --format '{{json .SecurityOptions}}')
 if [[ $docker_info == *userns* || $docker_info == *rootless* ]]; then
   echo "Docker user-namespace remapping/rootless mode is unsupported by this host-bound lab." >&2
@@ -218,39 +255,195 @@ for service_user in relay relay-dispatch relay-backend; do
   done
 done
 
-install -d -o root -g root -m 0755 /opt/relayforge /opt/relayforge/app \
-  /opt/relayforge/runtime /opt/relayforge/bin
-install -d -o root -g root -m 0711 /var/lib/relayforge /var/lib/relayforge/workers
-install -d -o root -g root -m 0700 /etc/relayforge /etc/relayforge/secrets \
-  /etc/relayforge/secrets/tls
-
 staging=$(mktemp -d /tmp/relayforge-install.XXXXXX)
 build_dir=$(mktemp -d /tmp/relayforge-build.XXXXXX)
 trap 'rm -rf -- "$staging" "$build_dir"' EXIT
-install -d "$staging/config" "$staging/control" "$staging/db" "$staging/web"
-install -m 0644 "$project_dir/compose.yaml" "$staging/compose.yaml"
-rsync -a --exclude='__pycache__' --exclude='*.pyc' "$project_dir/config/" "$staging/config/"
-rsync -a --exclude='__pycache__' --exclude='*.pyc' "$project_dir/control/" "$staging/control/"
-rsync -a "$project_dir/db/" "$staging/db/"
-rsync -a --exclude='__pycache__' --exclude='*.pyc' --exclude='.env' --exclude='.env.*' \
-  "$project_dir/web/" "$staging/web/"
-rsync -a --delete --chown=root:root --chmod=D0755,F0644 "$staging/" /opt/relayforge/app/
+
+# Build and validate the candidate before interrupting the running challenge.
+# If its bytes change, existing transient Workers would keep the old executable
+# mapping while Nginx published the new file, so wait for their bounded lifetime
+# (or cancel them during maintenance) rather than creating a mixed deployment.
+install -m 0644 "$project_dir/worker/relay-worker.c" "$project_dir/worker/Makefile" "$build_dir/"
+make -C "$build_dir" clean all
+readelf -h "$build_dir/relay-worker" | grep -Eq 'Type:[[:space:]]+DYN'
+readelf -lW "$build_dir/relay-worker" | grep -E 'GNU_STACK' | grep -qv 'RWE'
+readelf -lW "$build_dir/relay-worker" | grep -q 'GNU_RELRO'
+readelf -dW "$build_dir/relay-worker" | grep -q 'BIND_NOW'
+candidate_worker_sha256=$(sha256sum "$build_dir/relay-worker" | awk '{print $1}')
+if [[ ! $candidate_worker_sha256 =~ ^[0-9a-f]{64}$ ]]; then
+  echo "Unable to fingerprint the candidate Worker artifact." >&2
+  exit 1
+fi
+worker_binary_changes=1
+if [[ -f /opt/relayforge/bin/relay-worker && \
+      ! -L /opt/relayforge/bin/relay-worker ]] && \
+   cmp -s /opt/relayforge/bin/relay-worker "$build_dir/relay-worker"; then
+  worker_binary_changes=0
+fi
+if [[ $worker_binary_changes -eq 1 ]]; then
+  mapfile -t active_worker_units < <(
+    systemctl list-units --state=active --type=service --no-legend \
+      'relay-worker-*.service' | awk '{print $1}'
+  )
+  if [[ ${#active_worker_units[@]} -gt 0 ]]; then
+    echo "Refusing a binary-changing upgrade while transient Workers are active:" >&2
+    printf '  %s\n' "${active_worker_units[@]}" >&2
+    echo "Wait for their bounded lifetime or cancel them, then rerun the installer." >&2
+    exit 1
+  fi
+fi
+
+# Stop only the services whose on-disk programs/build contexts are about to be
+# reconciled. Existing transient Workers are preserved only after the candidate
+# check above establishes that their executable bytes will not change; systemd
+# owns the running processes and the restarted Supervisor restores UUID state.
+systemctl stop relayforge-stack.service 2>/dev/null || true
+systemctl stop relay-supervisor.service relay-backend.service 2>/dev/null || true
+remaining_relayforge_containers=$(
+  docker ps --filter label=com.docker.compose.project=relayforge \
+    --format '{{.ID}} {{.Names}}'
+)
+if [[ -n $remaining_relayforge_containers ]]; then
+  echo "RelayForge containers remain after stopping relayforge-stack.service:" >&2
+  printf '%s\n' "$remaining_relayforge_containers" >&2
+  echo "Stop the manually managed project before rerunning the installer." >&2
+  exit 1
+fi
+
+# Remove exact units from the superseded timer/permanent-Worker prototypes.
+# No wildcard is used here, so current services and transient
+# relay-worker-<UUID>.service units cannot be deleted by this cleanup.
+legacy_units=(
+  relay-cleanup.service
+  relay-cleanup.timer
+  relay-rotate.service
+  relay-rotate.timer
+  relay-worker.service
+)
+systemctl disable --now "${legacy_units[@]}" 2>/dev/null || true
+for legacy_unit in "${legacy_units[@]}"; do
+  rm -f -- "/etc/systemd/system/$legacy_unit"
+  systemctl reset-failed "$legacy_unit" 2>/dev/null || true
+done
+
+# The earlier bounded-root prototype installed this one systemctl-edit
+# override.  Keep its useful runtime-directory preservation in the canonical
+# unit, but remove the exact known file because its five-capability ceiling
+# contradicts this branch's deliberately unrestricted host-root objective.
+# Any different drop-in is administrator-owned unknown state and fails closed.
+legacy_supervisor_dropin_dir=/etc/systemd/system/relay-supervisor.service.d
+legacy_supervisor_dropin=$legacy_supervisor_dropin_dir/override.conf
+if [[ -L $legacy_supervisor_dropin_dir || \
+      ( -e $legacy_supervisor_dropin_dir && ! -d $legacy_supervisor_dropin_dir ) ]]; then
+  echo "Unsafe Supervisor drop-in path." >&2
+  exit 1
+fi
+if [[ -d $legacy_supervisor_dropin_dir ]]; then
+  mapfile -t supervisor_dropin_entries < <(
+    find "$legacy_supervisor_dropin_dir" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort
+  )
+  expected_legacy_dropin=$'[Service]\nRuntimeDirectory=relayforge\nRuntimeDirectoryMode=0750\nRuntimeDirectoryPreserve=yes\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID'
+  normalized_legacy_dropin=$(
+    sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$legacy_supervisor_dropin" 2>/dev/null || true
+  )
+  if [[ ${#supervisor_dropin_entries[@]} -ne 1 || \
+        ${supervisor_dropin_entries[0]:-} != override.conf || \
+        -L $legacy_supervisor_dropin || ! -f $legacy_supervisor_dropin || \
+        $(stat -c '%U:%G:%a' "$legacy_supervisor_dropin" 2>/dev/null || true) != root:root:644 || \
+        $normalized_legacy_dropin != "$expected_legacy_dropin" ]]; then
+    echo "Unknown Supervisor drop-in; inspect it instead of deleting it." >&2
+    exit 1
+  fi
+  rm -f -- "$legacy_supervisor_dropin"
+  rmdir -- "$legacy_supervisor_dropin_dir"
+fi
+systemctl daemon-reload
+
+# All three /opt trees below are owned exclusively by RelayForge.  Refuse
+# symlink/non-directory substitutions before rsync --delete applies the exact
+# runtime allowlists.
+for managed_directory in \
+  /opt/relayforge \
+  /opt/relayforge/app \
+  /opt/relayforge/runtime \
+  /opt/relayforge/bin; do
+  if [[ -L $managed_directory || ( -e $managed_directory && ! -d $managed_directory ) ]]; then
+    echo "Unsafe managed path: $managed_directory" >&2
+    exit 1
+  fi
+  if [[ -d $managed_directory && $(stat -c '%U:%G' "$managed_directory") != root:root ]]; then
+    echo "Managed path is not root-owned: $managed_directory" >&2
+    exit 1
+  fi
+done
+
+install -d -o root -g root -m 0755 /opt/relayforge /opt/relayforge/app \
+  /opt/relayforge/runtime /opt/relayforge/bin
+install -d -o root -g root -m 0711 /var/lib/relayforge /var/lib/relayforge/workers \
+  /var/lib/relayforge/stages
+install -d -o root -g root -m 0700 /etc/relayforge /etc/relayforge/secrets \
+  /etc/relayforge/secrets/tls
+install -o root -g relayforge-ipc -m 0440 "$project_dir/host/STAGE_2_WORKER.txt" \
+  /var/lib/relayforge/stages/STAGE_2_WORKER.txt
+install -o root -g root -m 0400 "$project_dir/host/STAGE_3_ROOT.txt" \
+  /var/lib/relayforge/stages/STAGE_3_ROOT.txt
+
+app_stage=$staging/app
+runtime_stage=$staging/runtime
+bin_stage=$staging/bin
+install -d \
+  "$app_stage/config" \
+  "$app_stage/control" \
+  "$app_stage/db/init" \
+  "$app_stage/web/app" \
+  "$app_stage/web/static" \
+  "$app_stage/web/templates" \
+  "$runtime_stage" \
+  "$bin_stage"
+
+# Compose runtime allowlist.  Repository tests, exploit helpers, READMEs and
+# host-only sysctl/Docker configuration never enter /opt/relayforge/app.
+install -m 0644 "$project_dir/compose.yaml" "$app_stage/compose.yaml"
+install -m 0644 "$project_dir/config/nginx.conf" "$app_stage/config/nginx.conf"
+for control_file in \
+  Dockerfile requirements.txt common.py policy.py access.py dispatcher.py healthcheck.py; do
+  install -m 0644 "$project_dir/control/$control_file" "$app_stage/control/$control_file"
+done
+install -m 0755 "$project_dir/db/init/001-init.sh" "$app_stage/db/init/001-init.sh"
+install -m 0644 "$project_dir/db/init/002-schema.sql.in" "$app_stage/db/init/002-schema.sql.in"
+for web_file in .dockerignore Dockerfile requirements.txt prefs.py STAGE_1_WEB.txt; do
+  install -m 0644 "$project_dir/web/$web_file" "$app_stage/web/$web_file"
+done
+for web_module in __init__.py auth.py config.py db.py raw_rpc.py; do
+  install -m 0644 "$project_dir/web/app/$web_module" "$app_stage/web/app/$web_module"
+done
+install -m 0644 "$project_dir/web/static/style.css" "$app_stage/web/static/style.css"
+for web_template in base.html connection.html cookie_policy.html dashboard.html login.html; do
+  install -m 0644 "$project_dir/web/templates/$web_template" \
+    "$app_stage/web/templates/$web_template"
+done
+rsync -a --delete --chown=root:root --chmod=D0755,F0644 "$app_stage/" /opt/relayforge/app/
 chmod 0555 /opt/relayforge/app/db/init/001-init.sh
 
 for runtime_file in supervisor.py backend.py firewall.py cleanup_state.py; do
-  install -o root -g root -m 0555 "$project_dir/host/$runtime_file" "/opt/relayforge/runtime/$runtime_file"
+  install -m 0555 "$project_dir/host/$runtime_file" "$runtime_stage/$runtime_file"
 done
-for runtime_script in init-challenge.sh apply-firewall.sh configure-firewall.sh harden-ssh.sh reset-lab.sh verify-hardening.sh; do
-  install -o root -g root -m 0555 "$project_dir/scripts/$runtime_script" "/opt/relayforge/runtime/$runtime_script"
+for runtime_script in init-challenge.sh configure-firewall.sh harden-ssh.sh reset-lab.sh verify-hardening.sh; do
+  install -m 0555 "$project_dir/scripts/$runtime_script" "$runtime_stage/$runtime_script"
 done
+rsync -a --delete --chown=root:root "$runtime_stage/" /opt/relayforge/runtime/
 
-install -m 0644 "$project_dir/worker/relay-worker.c" "$project_dir/worker/Makefile" "$build_dir/"
-make -C "$build_dir" clean all
-install -o root -g root -m 0755 "$build_dir/relay-worker" /opt/relayforge/bin/relay-worker
+install -m 0755 "$build_dir/relay-worker" "$bin_stage/relay-worker"
+rsync -a --delete --chown=root:root "$bin_stage/" /opt/relayforge/bin/
 readelf -h /opt/relayforge/bin/relay-worker | grep -Eq 'Type:[[:space:]]+DYN'
 readelf -lW /opt/relayforge/bin/relay-worker | grep -E 'GNU_STACK' | grep -qv 'RWE'
 readelf -lW /opt/relayforge/bin/relay-worker | grep -q 'GNU_RELRO'
 readelf -dW /opt/relayforge/bin/relay-worker | grep -q 'BIND_NOW'
+worker_artifact_sha256=$(sha256sum /opt/relayforge/bin/relay-worker | awk '{print $1}')
+if [[ $worker_artifact_sha256 != "$candidate_worker_sha256" ]]; then
+  echo "Installed Worker artifact differs from the validated candidate." >&2
+  exit 1
+fi
 
 for unit in relay-supervisor.service relay-backend.service relayforge-firewall.service relayforge-stack.service; do
   install -o root -g root -m 0644 "$project_dir/host/$unit" "/etc/systemd/system/$unit"
@@ -376,12 +569,19 @@ if [[ $defer_ssh -eq 0 ]]; then
 fi
 
 systemctl daemon-reload
+
+if ss -ltnH | awk '{print $4}' | grep -Eq '(^|:)443$'; then
+  echo "TCP 443 is already in use after stopping RelayForge; remove the conflicting host service." >&2
+  ss -ltnp '( sport = :443 )' >&2 || true
+  exit 1
+fi
 /usr/bin/docker compose --project-directory /opt/relayforge/app \
   --env-file "$compose_environment" config --quiet
 /usr/bin/docker compose --project-directory /opt/relayforge/app \
   --env-file "$compose_environment" pull edge postgres
 /usr/bin/docker compose --project-directory /opt/relayforge/app \
   --env-file "$compose_environment" build --pull
+printf 'Installed Worker artifact SHA-256: %s\n' "$worker_artifact_sha256"
 
 if [[ $defer_firewall -eq 1 ]]; then
   systemctl disable --now relayforge-stack.service relayforge-firewall.service \
@@ -396,5 +596,12 @@ systemctl enable relay-backend.service relay-supervisor.service \
 systemctl restart relay-backend.service relay-supervisor.service
 systemctl restart relayforge-firewall.service
 systemctl restart relayforge-stack.service
+# A file bind refers to an inode. Recreate edge explicitly so an edge container
+# left running outside systemd cannot keep serving a pre-upgrade Worker after
+# rsync atomically replaces the host pathname.
+/usr/bin/docker compose --project-directory /opt/relayforge/app \
+  --env-file "$compose_environment" up --detach --no-build --no-deps \
+  --force-recreate --wait --wait-timeout 120 edge
 /opt/relayforge/runtime/verify-hardening.sh
+apt-get clean
 echo "RelayForge unrestricted-root installation and deployment verification completed."

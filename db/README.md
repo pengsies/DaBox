@@ -1,9 +1,8 @@
 # Database integration handoff
 
-This is the deployable database for the bounded Flask variant. The reviewed
-prototype correctly identified two useful requirements retained here: separate
-login roles for each service and deployment-supplied passwords rather than
-credentials embedded in SQL.
+This is the deployable database for the bounded Flask challenge. It uses
+separate login roles for each service and deployment-supplied passwords rather
+than credentials embedded in SQL.
 
 The integrated version adds the schema, state machine, endpoint data, restricted
 RPCs, privilege revocation, and input bounds required by the rest of RelayForge.
@@ -23,6 +22,12 @@ There is deliberately no separate database Dockerfile. PostgreSQL is configured
 from the pinned upstream image in `compose.yaml`, with these initialization files
 mounted read-only.
 
+`install.sh` copies only `init/001-init.sh` and `init/002-schema.sql.in` into
+`/opt/relayforge/app/db/init`; this README and any historical/export material
+remain repository-only. An ordinary reinstall preserves the named PostgreSQL
+volume. Destroying it requires the explicit `reset-lab.sh --yes` workflow; the
+installer does not run `down --volumes` or global Docker prune.
+
 ## Runtime boundary
 
 ```text
@@ -38,9 +43,15 @@ dependency; it receives only a root-created configuration from the Supervisor
 and may connect only to the configured signed endpoint under the host egress
 policy.
 
+There is no database-stage marker. Calling a granted RPC or compromising a
+database/container process demonstrates only that component's capability. It
+does not prove the native `relay` Worker stage, and container UID 0 is not
+Ubuntu-host UID 0. The host Stage 2/3 marker directory is not mounted into
+PostgreSQL or any other container.
+
 ## Verification
 
-Run from `responsibilities/shared`:
+Run from the repository root:
 
 ```bash
 python3 tests/check_integrated_stage.py

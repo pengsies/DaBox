@@ -1,0 +1,2 @@
+RELAYFORGE_STAGE=1_WEB_CONTAINER
+helooo :D if you see this, it means that you have command execution inside a container but not on the host. your goal is to get root access on the host, remember? if you need some help, try checking out the db adapter

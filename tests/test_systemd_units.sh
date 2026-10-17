@@ -36,12 +36,14 @@ docker run --rm --platform linux/amd64 \
       RestrictNamespaces=no \
       RestrictSUIDSGID=no \
       MemoryDenyWriteExecute=no \
-      LockPersonality=no
+      LockPersonality=no \
+      RuntimeDirectoryPreserve=yes \
+      "CapabilityBoundingSet=~"
     do
       grep -Fqx "$declaration" "$supervisor"
     done
     grep -Fq "INTENTIONAL-VULNERABILITY RF-SUP-ROOT-01" "$supervisor"
-    ! grep -Eq "^[[:space:]]*(CapabilityBoundingSet|AmbientCapabilities)=" "$supervisor"
+    ! grep -Eq "^[[:space:]]*AmbientCapabilities=" "$supervisor"
     systemd-analyze --version | grep -Eq "^systemd (25[5-9]|2[6-9][0-9]|[3-9][0-9]{2})"
   '
 echo "PASS: systemd units validate and Supervisor explicitly runs unrestricted root"

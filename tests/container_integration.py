@@ -51,6 +51,7 @@ def run_compose(
 ) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment["RF_TEST_SECRETS"] = str(secrets)
+    environment["RF_TEST_WORKER"] = str(secrets / "relay-worker")
     return subprocess.run(
         [*compose_command(secrets), *arguments], cwd=ROOT, env=environment,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -98,6 +99,34 @@ def csrf_from(page: bytes) -> str:
     if matched is None:
         raise IntegrationError("page did not contain a CSRF token")
     return matched.group(1).decode("ascii")
+
+
+def verify_worker_artifact(client: urllib.request.OpenerDirector) -> None:
+    status, robots, _ = request(client, BASE + "/robots.txt")
+    if status != 200 or b"Allow: /artifacts/relay-worker" not in robots:
+        raise IntegrationError("robots.txt did not advertise the Worker artifact")
+
+    artifact_request = urllib.request.Request(BASE + "/artifacts/relay-worker")
+    with client.open(artifact_request, timeout=8) as response:
+        artifact = response.read()
+        if response.status != 200:
+            raise IntegrationError(
+                f"Worker artifact returned HTTP {response.status}"
+            )
+        if response.headers.get_content_type() != "application/octet-stream":
+            raise IntegrationError("Worker artifact content type changed")
+        if 'filename="relay-worker"' not in response.headers.get(
+            "Content-Disposition", ""
+        ):
+            raise IntegrationError("Worker artifact download filename changed")
+        if response.headers.get("Cache-Control") != "no-store":
+            raise IntegrationError("Worker artifact is not marked no-store")
+        if response.headers.get("X-Content-Type-Options") != "nosniff":
+            raise IntegrationError("Worker artifact is missing nosniff")
+
+    expected = (ROOT / "worker" / "relay-worker.c").read_bytes()
+    if artifact != expected:
+        raise IntegrationError("Worker artifact route changed the mounted bytes")
 
 
 def login(
@@ -215,6 +244,19 @@ def exploit_raw(options: str) -> str:
     return str(uuid.UUID(matched.group(0)))
 
 
+def exploit_command(command: str) -> str:
+    completed = subprocess.run(
+        [
+            sys.executable, str(ROOT / "web/tools/exploit_stage1.py"), BASE,
+            "--username", GUEST_USER, "--password", GUEST_PASSWORD,
+            "--insecure", "--command", command,
+        ],
+        cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, timeout=25, check=True,
+    )
+    return completed.stdout
+
+
 def submit_raw_sql(secrets: Path, options: str) -> str:
     literal = options.replace("'", "''")
     output = sql(
@@ -294,7 +336,14 @@ def main() -> int:
         expected_endpoint = target_endpoint(args.secrets, "archive-echo")
 
         client, jar = opener()
+        verify_worker_artifact(client)
         csrf = login(client, jar)
+
+        stage_one = exploit_command(
+            "id -u; cat /opt/relayforge/web/STAGE_1_WEB.txt"
+        )
+        if not stage_one.startswith("65532\n") or "RELAYFORGE_STAGE=1_WEB_CONTAINER" not in stage_one:
+            raise IntegrationError("Web RCE did not prove UID 65532 and read its stage marker")
 
         bad_status, bad_body = post_json(
             client, "/api/request",
@@ -398,6 +447,23 @@ def main() -> int:
         ).stdout
         if "docker.sock" in inspection or "job-signing.pem" in inspection:
             raise IntegrationError("web container received a host-control/signing mount")
+        marker_metadata = subprocess.run(
+            [
+                "docker", "exec", web_id, "stat", "-c", "%u:%g:%a",
+                "/opt/relayforge/web/STAGE_1_WEB.txt",
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            timeout=10, check=True,
+        ).stdout.strip()
+        if marker_metadata != "0:0:444":
+            raise IntegrationError(f"Web marker metadata changed: {marker_metadata!r}")
+        host_marker_probe = subprocess.run(
+            ["docker", "exec", web_id, "test", "-e", "/var/lib/relayforge/stages/STAGE_2_WORKER.txt"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+            check=False,
+        )
+        if host_marker_probe.returncode == 0:
+            raise IntegrationError("Web container can see a host stage marker")
     except (
         IntegrationError, OSError, ValueError, KeyError, json.JSONDecodeError,
         subprocess.SubprocessError,
@@ -405,8 +471,8 @@ def main() -> int:
         print(f"FAIL: container integration: {exc}", file=sys.stderr)
         return 1
     print(
-        "PASS: HTTPS→Flask authenticated pickle→raw RPC, safe API, "
-        "cancellation, parser differential, and Ed25519 integration"
+        "PASS: HTTPS→Flask stage-1 marker→raw RPC, safe API, cancellation, "
+        "parser differential, and Ed25519 integration"
     )
     return 0
 

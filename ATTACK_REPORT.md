@@ -15,6 +15,14 @@ The challenge intentionally contains a chained set of vulnerabilities. It must
 run only on an isolated, disposable training host with no real data or
 privileged cloud role.
 
+The shortcut assessment in this report is deliberately qualified. For a clean
+installation with the bundled configuration, there is no known
+participant-controlled route to Ubuntu-host UID 0 other than the documented
+chain. That is an implementation review result, not a proof that Linux,
+Docker, PostgreSQL, nginx, or future RelayForge code can never contain another
+vulnerability. Unknown manual changes on an existing host are outside that
+claim.
+
 ## Intended route
 
 ```text
@@ -45,7 +53,30 @@ training account is `guest / guest-relay-2026`.
 
 The player is not assumed to have SSH, a host account, a database credential,
 the signing key, the Supervisor socket, a Worker token, Docker access, or host
-filesystem access. The internal HTTP endpoint is not published directly.
+filesystem access. In particular, players must never receive the EC2
+administrator PEM: the deployment administrator is a passwordless-sudo and
+Docker-group account, so possession of that key is an operational shortcut to
+host root rather than part of the challenge. The internal HTTP endpoint is not
+published directly.
+
+## What "root" means in this report
+
+Several identities can be informally called root, but they are not equivalent:
+
+- Web command execution is numeric UID/GID `65532:65532` inside the Web
+  container.
+- PostgreSQL's `postgres` role is a database superuser. It controls that
+  database cluster, not the Ubuntu kernel or host filesystem. The player-facing
+  `relay_web` role is not this superuser.
+- Container UID 0 is privileged within a container's namespaces. Without a
+  separate escape or host-control mount such as the Docker socket, it is not
+  Ubuntu-host UID 0.
+- The Docker daemon and RelayForge Supervisor are host root services by design.
+  Their existence does not mean the attacker controls them.
+- The final intended result is attacker-controlled UID 0 in the host namespace.
+  That identity can change the VM, containers, firewall, accounts, and services.
+
+Only the last item is accepted as the challenge's final privilege level.
 
 ## Intentional vulnerability inventory
 
@@ -212,6 +243,14 @@ and returns `{"ok":true,"state":"validated"}`.
 The intentional flaw is that validation and use do not share an open file
 descriptor. During the deterministic 250 ms delay, the attacker atomically
 replaces the checked pathname with an executable script that launches `/bin/sh`.
+
+The canonical Supervisor unit has no namespace, filesystem, device,
+no-new-privileges, or execution sandbox. It explicitly uses
+`CapabilityBoundingSet=~`, which resets the service to every capability the
+running kernel supports. Acceptance compares the Supervisor process's
+permitted, effective, and bounding masks with `/proc/sys/kernel/cap_last_cap`;
+merely observing UID 0 with a narrowed capability set is not accepted as this
+challenge's unrestricted-root stage.
 Supervisor then executes that pathname as UID 0 with the same Unix socket as
 stdin, stdout, and stderr.
 
@@ -264,6 +303,26 @@ Current source-level and local component evidence includes:
   real `CONNECT` tunnelling, PIE leak, callback overwrite, and relay shell; and
 - shell syntax and Compose-model validation.
 
+The deployment also contains three source-known progress breadcrumbs described
+in `STAGE_MARKERS.md`. Acceptance requires the Web foothold to read Stage 1,
+the `relay` shell to read Stage 2 while failing to read Stage 3 and `root.txt`,
+and the raced UID-0 stream to read Stage 3 plus the generated flag. Marker text
+alone is never accepted as proof of a privilege level: it is committed source
+text and can be copied or memorized. Effective UID, namespace/cgroup context,
+later-stage access denials, and the deployment-generated root flag are the
+actual evidence.
+
+Stage 2 is `root:relayforge-ipc` mode `0440`. Both host accounts `relay` and
+`relay-dispatch` are members of that group, so a host process running as either
+identity can read this non-secret breadcrumb. The Dispatcher container does not
+receive the host stage directory as a mount. This group-readable detail is not
+an authorization or scoring boundary.
+
+Every canonical `install.sh` run reinstalls all three marker files from the
+release and restores their documented ownership and modes. This repairs marker
+drift for the next clean exercise, but it does not prove that a machine which
+previously yielded unrestricted root is trustworthy.
+
 Historical EC2 results for the bounded disclosure build do not prove this
 unrestricted-root variant. A successful current `tests/run-vm.sh` execution
 that proves `uid=0` and reads the exact root flag on a fresh disposable VM must
@@ -275,6 +334,8 @@ be recorded before claiming a complete deployed-VM PASS.
   maintainer material private if participants are expected to discover it.
 - The root flag is generated per deployment and rotated by the reset script;
   no real flag value is committed to source.
+- The three committed stage-marker files are explanatory breadcrumbs, not
+  secret or score-submission flags.
 - The acknowledgement and fixed delay make the intended pathname replacement
   deterministic enough for a teaching environment.
 - Worker sandboxing and the pre-final-stage trust boundaries still prevent
@@ -283,6 +344,24 @@ be recorded before claiming a complete deployed-VM PASS.
 - Never deploy this stack alongside real data, credentials, other workloads,
   or any EC2 instance role. Destroy/reimage it after a solver reaches root;
   `reset-lab.sh` is not a security boundary against unrestricted UID 0.
+
+The no-known-shortcut conclusion assumes the documented starting position and
+the harmless bundled endpoint at `127.0.0.1:19001`. It specifically excludes:
+
+- disclosure of the administrator PEM or any other sudo/Docker credential;
+- approving a privileged target such as an unauthenticated Docker TCP API,
+  cloud instance-metadata service, or another administrative local service;
+- a Linux-kernel, container-runtime, Docker, or other infrastructure escape;
+- a new flaw introduced into the deliberately root-running Supervisor; and
+- another command-execution primitive already inside the active Worker's
+  cgroup. The diagnose gate establishes kernel UID and cgroup membership, not
+  which Worker bug supplied code execution.
+
+No reusable SSH key, personal token, cloud credential, or instance role may be
+present on a player VM. Normal installer cleanup, marker restoration, or
+`reset-lab.sh` can return an uncompromised exercise to canonical challenge
+state; none can remediate a host after an attacker has controlled UID 0. That
+host must be destroyed and recreated from a known-good image.
 
 For a participant-oriented walkthrough, including the exact container-to-host
 trust-boundary transitions, see `PLAYER_ATTACK_GUIDE.md`.

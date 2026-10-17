@@ -1,0 +1,2 @@
+RELAYFORGE_STAGE=2_HOST_RELAY_WORKER
+yippee you've finally reached the host (albeit as an unprivileged account)! you should try inspecting the diagnostic interfaces for this active worker if you're stuck

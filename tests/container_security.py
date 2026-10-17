@@ -35,6 +35,7 @@ EXPECTED_CAPS = {
 def compose(secrets: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment["RF_TEST_SECRETS"] = str(secrets)
+    environment["RF_TEST_WORKER"] = str(secrets / "relay-worker")
     return subprocess.run(
         [
             "docker",
@@ -111,6 +112,21 @@ def main() -> int:
                 expected = {"443/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8443"}]}
                 if ports != expected:
                     raise AssertionError(f"integration edge port binding changed: {ports}")
+                artifact_mounts = [
+                    mount for mount in data.get("Mounts", [])
+                    if mount.get("Destination") == "/etc/nginx/artifacts/relay-worker"
+                ]
+                if len(artifact_mounts) != 1:
+                    raise AssertionError("edge does not have exactly one Worker artifact mount")
+                artifact_mount = artifact_mounts[0]
+                if (
+                    artifact_mount.get("Source") != str(args.secrets / "relay-worker")
+                    or artifact_mount.get("RW") is not False
+                    or artifact_mount.get("Type") != "bind"
+                ):
+                    raise AssertionError(
+                        f"edge Worker artifact mount changed: {artifact_mount}"
+                    )
             elif ports:
                 raise AssertionError(f"{service} unexpectedly publishes a port: {ports}")
 
@@ -119,6 +135,19 @@ def main() -> int:
                 raise AssertionError(f"{service} image is not AMD64")
 
         access_id = compose(args.secrets, "ps", "--quiet", "access").stdout.strip()
+        web_id = compose(args.secrets, "ps", "--quiet", "web").stdout.strip()
+        web_marker = subprocess.run(
+            [
+                "docker", "exec", web_id, "stat", "-c", "%u:%g:%a",
+                "/opt/relayforge/web/STAGE_1_WEB.txt",
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            timeout=5, check=True,
+        ).stdout.strip()
+        if web_marker != "0:0:444":
+            raise AssertionError(f"Web stage marker metadata changed: {web_marker}")
+        if "/var/lib/relayforge/stages" in json.dumps(inspect(web_id).get("Mounts", [])):
+            raise AssertionError("Web container received the host stage-marker directory")
         outbound = subprocess.run(
             [
                 "docker",

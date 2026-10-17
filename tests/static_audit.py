@@ -87,6 +87,23 @@ class Audit:
                 f"intentional marker count changed: {marker}",
             )
 
+    def stage_markers(self) -> None:
+        expected = {
+            "web/STAGE_1_WEB.txt": "RELAYFORGE_STAGE=1_WEB_CONTAINER",
+            "host/STAGE_2_WORKER.txt": "RELAYFORGE_STAGE=2_HOST_RELAY_WORKER",
+            "host/STAGE_3_ROOT.txt": "RELAYFORGE_STAGE=3_UNRESTRICTED_HOST_ROOT",
+        }
+        for relative, first_line in expected.items():
+            content = self.read(relative)
+            lines = content.splitlines()
+            self.require(
+                len(lines) == 2
+                and lines[0] == first_line
+                and bool(lines[1].strip())
+                and "RF{" not in content,
+                f"stage marker content changed: {relative}",
+            )
+
     def web(self) -> None:
         application = self.read("web/app/__init__.py")
         authentication = self.read("web/app/auth.py")
@@ -147,7 +164,8 @@ class Audit:
         self.require(
             "USER 65532:65532" in dockerfile
             and "gunicorn" in dockerfile
-            and "0.0.0.0:8080" in dockerfile,
+            and "0.0.0.0:8080" in dockerfile
+            and "COPY --chown=0:0 STAGE_1_WEB.txt ./STAGE_1_WEB.txt" in dockerfile,
             "Flask container identity or listener changed",
         )
         self.require(
@@ -156,9 +174,21 @@ class Audit:
             and "return 404" in nginx,
             "edge does not reject hidden/legacy paths",
         )
+        self.require(
+            "location = /artifacts/relay-worker" in nginx
+            and "alias /etc/nginx/artifacts/relay-worker;" in nginx
+            and nginx.count("add_header X-Content-Type-Options nosniff always;") == 2,
+            "exact Worker artifact download route is missing",
+        )
+        self.require(
+            "location = /robots.txt" in nginx
+            and "Allow: /artifacts/relay-worker" in nginx,
+            "robots.txt does not advertise the Worker artifact route",
+        )
 
     def compose(self) -> None:
         compose = self.read("compose.yaml")
+        integration = self.read("tests/compose.integration.yaml")
         dockerfiles = self.read("web/Dockerfile") + self.read("control/Dockerfile")
         combined = compose + dockerfiles
         digests = re.findall(r"sha256:[0-9a-f]{64}", combined)
@@ -168,8 +198,26 @@ class Audit:
         )
         self.require(compose.count("ports:") == 1, "more than one Compose service publishes ports")
         self.require('"0.0.0.0:443:443"' in compose, "edge HTTPS publication is missing")
+        self.require(
+            "source: /opt/relayforge/bin/relay-worker" in compose
+            and "target: /etc/nginx/artifacts/relay-worker" in compose
+            and "read_only: true" in compose
+            and "create_host_path: false" in compose,
+            "edge does not have the exact read-only Worker artifact mount",
+        )
+        self.require(
+            "volumes: !override" in integration
+            and "RF_TEST_WORKER" in integration
+            and "target: /etc/nginx/artifacts/relay-worker" in integration
+            and "./config/nginx.conf:/etc/nginx/nginx.conf:ro" in integration,
+            "container integration does not replace all edge artifact fixtures",
+        )
         for forbidden in ("docker.sock", "privileged:", "network_mode: host", "pid: host"):
             self.require(forbidden not in compose, f"forbidden Compose escape surface: {forbidden}")
+        self.require(
+            "/var/lib/relayforge/stages" not in compose,
+            "host stage-marker directory is mounted into a container",
+        )
         self.require(compose.count("internal: true") == 2, "frontend/database networks are not both internal")
         self.require("cap_drop:\n    - ALL" in compose, "common container capability drop is missing")
         self.require('restart: "no"' in compose, "Docker restart policy can race the boot firewall")
@@ -230,6 +278,7 @@ class Audit:
         access = self.read("control/access.py")
         supervisor = self.read("host/supervisor.py")
         supervisor_unit = self.read("host/relay-supervisor.service")
+        stack_unit = self.read("host/relayforge-stack.service")
         worker = self.read("worker/relay-worker.c")
         makefile = self.read("worker/Makefile")
         firewall = self.read("host/firewall.py")
@@ -315,12 +364,10 @@ class Audit:
                 f"unrestricted-root challenge unit no longer declares {weakening}",
             )
         self.require(
-            re.search(
-                r"^\s*(?:CapabilityBoundingSet|AmbientCapabilities)=",
-                supervisor_unit,
-                re.MULTILINE,
-            ) is None,
-            "Supervisor root capability set is unexpectedly bounded",
+            "CapabilityBoundingSet=~" in supervisor_unit
+            and "RuntimeDirectoryPreserve=yes" in supervisor_unit
+            and re.search(r"^\s*AmbientCapabilities=", supervisor_unit, re.MULTILINE) is None,
+            "Supervisor does not explicitly preserve its socket directory and full capability set",
         )
         self.require("argc != 3" in worker and "usage: relay-worker PORT CONFIG" in worker, "Worker argv contains more than port/config")
         self.require(
@@ -365,6 +412,13 @@ class Audit:
             "installer does not require explicit acknowledgement of unrestricted host root",
         )
         self.require(
+            'install -o root -g relayforge-ipc -m 0440 "$project_dir/host/STAGE_2_WORKER.txt"' in install
+            and 'install -o root -g root -m 0400 "$project_dir/host/STAGE_3_ROOT.txt"' in install
+            and "/var/lib/relayforge/stages/STAGE_2_WORKER.txt" in verifier
+            and "/var/lib/relayforge/stages/STAGE_3_ROOT.txt" in verifier,
+            "host stage-marker ownership or verification contract changed",
+        )
+        self.require(
             '"--uid-owner"' in firewall
             and '"ENDPOINT_HOST"' in firewall
             and '"ENDPOINT_PORT"' in firewall,
@@ -376,7 +430,88 @@ class Audit:
             and "-----BEGIN ([A-Z0-9 ]+ )?PRIVATE KEY-----" in verifier,
             "runtime private-key scan can match the verifier itself",
         )
-        self.require("staging/control" in install and "staging/web" in install and "staging/attacks" not in install, "installer may copy attack tooling into runtime")
+        self.require(
+            'app_stage=$staging/app' in install
+            and '"$app_stage/control"' in install
+            and '"$app_stage/web/app"' in install
+            and '"$app_stage/web/templates"' in install
+            and '"$app_stage/web/static"' in install
+            and '"$project_dir/web/tools/"' not in install
+            and '"$project_dir/web/tests/"' not in install
+            and '"$project_dir/attacks/"' not in install
+            and '"$project_dir/db/README.md"' not in install
+            and '"$project_dir/config/nginx.conf"' in install,
+            "installer Compose tree is not an explicit runtime allowlist",
+        )
+        self.require(
+            'runtime_stage=$staging/runtime' in install
+            and 'bin_stage=$staging/bin' in install
+            and 'rsync -a --delete --chown=root:root "$runtime_stage/" /opt/relayforge/runtime/' in install
+            and 'rsync -a --delete --chown=root:root "$bin_stage/" /opt/relayforge/bin/' in install
+            and 'apply-firewall.sh' not in install,
+            "installer does not reconcile the managed runtime/bin allowlists",
+        )
+        self.require(
+            'worker_artifact_sha256=$(sha256sum /opt/relayforge/bin/relay-worker' in install
+            and "candidate_worker_sha256" in install
+            and "active_worker_units" in install
+            and "Refusing a binary-changing upgrade" in install
+            and install.index('make -C "$build_dir" clean all')
+            < install.rindex("systemctl stop relayforge-stack.service")
+            and "--force-recreate --wait --wait-timeout 120 edge" in install
+            and 'fetch("/robots.txt")' in verifier
+            and 'fetch("/artifacts/relay-worker")' in verifier
+            and 'cmp -s /opt/relayforge/bin/relay-worker "$worker_artifact_probe"' in verifier,
+            "installer does not verify the public Worker artifact against the deployed binary",
+        )
+        self.require(
+            all(
+                name in install
+                for name in (
+                    "relay-cleanup.service",
+                    "relay-cleanup.timer",
+                    "relay-rotate.service",
+                    "relay-rotate.timer",
+                    "relay-worker.service",
+                )
+            )
+            and 'rm -f -- "/etc/systemd/system/$legacy_unit"' in install
+            and 'disable --now relay-worker-*' not in install
+            and 'rm -f -- "/etc/systemd/system/relay-worker-*' not in install,
+            "installer legacy-unit cleanup is missing or over-broad",
+        )
+        self.require(
+            "legacy_supervisor_dropin_dir=/etc/systemd/system/relay-supervisor.service.d" in install
+            and "expected_legacy_dropin=" in install
+            and 'rm -f -- "$legacy_supervisor_dropin"' in install
+            and "Unknown Supervisor drop-in" in install
+            and "Supervisor has no overriding systemd drop-ins" in verifier
+            and "/proc/sys/kernel/cap_last_cap" in verifier
+            and 'supervisor_bounding == "$full_capability_mask"' in verifier,
+            "installer/verifier does not reconcile the known bounded-root Supervisor override",
+        )
+        self.require(
+            "foreign_containers" in install
+            and 'com.docker.compose.project' in install
+            and "non-RelayForge containers" in install
+            and "remaining_relayforge_containers" in install
+            and "Stop the manually managed project" in install,
+            "installer can disrupt an unrelated running container",
+        )
+        self.require(
+            "ExecStartPre=/usr/bin/test -f /opt/relayforge/bin/relay-worker" in stack_unit,
+            "stack service does not fail closed when the Worker artifact is absent",
+        )
+        self.require(
+            re.search(r"\bcurl\b", install) is None
+            and "apt-get autoremove" not in install
+            and "apt-get purge" not in install
+            and "docker system prune" not in install
+            and "docker image prune" not in install
+            and "docker volume prune" not in install
+            and "down --volumes" not in install,
+            "installer contains unused or broad host/Docker cleanup",
+        )
         self.require(
             "FLASK_SECRET_KEY" in install
             and "openssl rand -hex 32" in install
@@ -388,6 +523,11 @@ class Audit:
             and "Restart=always" not in supervisor
             and "WORKER_ROTATION_SECONDS" not in supervisor,
             "bounded shared Supervisor contains parent-lab rotation behavior",
+        )
+        self.require(
+            "/var/lib/relayforge/stages/STAGE_3_ROOT.txt" in supervisor
+            and "InaccessiblePaths=" in supervisor,
+            "Worker sandbox does not explicitly hide the root-only stage marker",
         )
         self.require(re.search(r"^\s*source\s", install, re.MULTILINE) is None and re.search(r"^\s*\.\s+/", install, re.MULTILINE) is None, "installer sources a root configuration file")
 
@@ -408,11 +548,15 @@ class Audit:
             and "tunnel target did not return HTTP" in full_chain,
             "full-chain verifier omits Worker negative/tunnel checks",
         )
-        self.require("relay could read the root flag directly" in full_chain, "full-chain verifier omits direct-read denial")
+        self.require(
+            "relay could read a root-only marker or flag directly" in full_chain,
+            "full-chain verifier omits direct root-marker/flag denial",
+        )
         self.require(
             "ROOT_UID_PROOF_RE.search(race_output)" in full_chain
+            and "ROOT_STAGE_PROOF_RE.search(race_output)" in full_chain
             and "ROOT_FLAG_PROOF_RE.search(race_output)" in full_chain
-            and "race_rc != 0 or uid_match is None or flag_match is None" in full_chain,
+            and "stage_match is None" in full_chain,
             "full-chain verifier can report a false-positive root diagnostic race",
         )
         self.require("return 1" in full_chain and "return 1" in race, "attack tooling does not fail closed")
@@ -421,13 +565,15 @@ class Audit:
             and 'acknowledgement.get("state") != "validated"' in race
             and "os.replace(replacement_path, race_path)" in race
             and "PROOF_UID_RE.search(transcript)" in race
+            and "PROOF_STAGE_RE.search(transcript)" in race
             and "PROOF_FLAG_RE.search(transcript)" in race,
-            "diagnostic exploit does not synchronize, replace atomically, and prove UID 0 plus flag read",
+            "diagnostic exploit does not prove UID 0 plus root-marker and flag reads",
         )
 
     def run(self) -> int:
         self.filesystem()
         self.intentional_surface()
+        self.stage_markers()
         self.web()
         self.compose()
         self.database()

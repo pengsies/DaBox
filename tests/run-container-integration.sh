@@ -25,6 +25,7 @@ dispatch_compose=(
   --env-file "$root/.env.example"
 )
 export RF_TEST_SECRETS=$secret_dir
+export RF_TEST_WORKER=$secret_dir/relay-worker
 
 cleanup() {
   "${dispatch_compose[@]}" down --volumes --remove-orphans --timeout 15 >/dev/null 2>&1 || true
@@ -33,6 +34,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 install -d -m 0700 "$secret_dir/tls"
+install -m 0444 "$root/worker/relay-worker.c" "$RF_TEST_WORKER"
 openssl genpkey -algorithm ED25519 -out "$secret_dir/job-signing.pem" >/dev/null 2>&1
 openssl pkey -in "$secret_dir/job-signing.pem" -pubout \
   -out "$secret_dir/job-signing.pub" >/dev/null 2>&1
